@@ -1,0 +1,14 @@
+# Core
+python-dotenv>=1.0
+psycopg2-binary>=2.9
+pandas>=2.2
+
+# Retry / utilities
+tenacity>=8.2
+
+# OpenAI API + tokenization
+openai>=1.40
+tiktoken>=0.7
+
+# UI
+streamlit>=1.36
