@@ -232,6 +232,28 @@ Examples:
   JOIN ic.workflows w ON w.workflow_id = c.workflow_id
   WHERE c.clause_name ILIKE 'clause_%indemn%';
 
+
+-- Imported workflows (Ironclad “imports”)
+Imported contracts are identified by the presence of "importId" in attributes.
+
+Examples:
+- Count all imported contracts:
+    SELECT COUNT(*) 
+    FROM ic.workflows
+    WHERE attributes ? 'importId';
+
+- List imported contracts with governing law California:
+    SELECT readable_id, attributes->'governingLaw'->>'value' AS governing_law
+    FROM ic.workflows
+    WHERE attributes ? 'importId'
+      AND attributes->'governingLaw'->>'value' ILIKE '%California%';
+
+- Show imported contracts with a one-year agreement term:
+    SELECT readable_id, attributes->'agreementTerm'->>'value' AS agreement_term
+    FROM ic.workflows
+    WHERE attributes ? 'importId'
+      AND attributes->'agreementTerm'->>'value' ILIKE '%one year%';
+
 -- Text search corpus + embeddings (for mention/snippet/semantic)
 Table: contract_texts
 - readable_id (TEXT, PK)
