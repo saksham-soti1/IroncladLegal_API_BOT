@@ -72,6 +72,10 @@ VENDOR/COUNTERPARTY:
 - Prefer ic.workflows.counterparty_name when filtering by vendor/counterparty.
 - If NULL, fallback to COALESCE(legal_entity,'') ILIKE or title ILIKE.
 
+- Imported contracts: always filter with "attributes ? 'importId'".
+  Do NOT guess based on title or record_type.
+
+
 CONSTANTS:
 - Do NOT use parameter placeholders like %s. Inline constants as proper SQL string literals (escape ' by doubling).
 - Return exactly one SQL block fenced with ```sql ... ```
