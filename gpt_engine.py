@@ -74,7 +74,55 @@ VENDOR/COUNTERPARTY:
 
 - Imported contracts: always filter with "attributes ? 'importId'".
   Do NOT guess based on title or record_type.
+  For time-based questions (e.g. "imports by month"), always use
+    (attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+  instead of created_at or agreementDate/standard_executedDate.
+  When filtering imported contracts by a given month, never use HAVING with the alias.
+  Instead, repeat the DATE_TRUNC(...) expression directly inside the WHERE clause.
 
+
+QUARTER WINDOWS:
+- Always determine quarter ranges using CURRENT_DATE and calendar quarters.
+- "Last quarter" = the previous full calendar quarter:
+    execution_date >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '3 months'
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE)
+- "This quarter" = the current full calendar quarter:
+    execution_date >= date_trunc('quarter', CURRENT_DATE)
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+- "Next quarter" = the next full calendar quarter:
+    execution_date >= date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '6 months'
+- For explicit quarters like "Q1 2024" or "Q3 2023":
+    Use EXTRACT(YEAR FROM execution_date)=YYYY
+    AND EXTRACT(QUARTER FROM execution_date)=N
+    (Q1=1, Q2=2, Q3=3, Q4=4).
+- Never approximate with “last 3 months.” Always anchor to CURRENT_DATE and use calendar quarter boundaries.
+- Never use INTERVAL '1 quarter' (invalid). Use INTERVAL '3 months' instead.
+- The current year is 2025. 
+
+APPROVALS:
+- Always join ic.approvals (a) with ic.role_assignees (ra) ON workflow_id + role_id to resolve user_name.
+- For “[NAME] approved contracts”: filter ra.user_name ILIKE '%Name%' AND a.status='approved'.
+- For “[NAME] pending approvals”: filter ra.user_name ILIKE '%Name%' AND a.status='pending'.
+- Workflow scope:
+    • If question mentions “in progress” → add w.status='active'.
+    • If question mentions “completed” → add w.status='completed'.
+    • Otherwise default to all workflows (no filter on w.status).
+
+DEPARTMENT LOGIC:
+- Department values in ic.workflows may be messy, especially for imported workflows (OCR errors, typos, personal names).
+- Always prefer ic.workflows.department if it looks valid.
+- If department is invalid, fallback to ic.workflows.owner_name.
+- If both are invalid or NULL, use 'Department not specified'.
+- Validity checks for department:
+    • Likely a personal name if two words are both capitalized (e.g., "MAGGIE SISTI").
+    • Suspicious if the value appears only once or very rarely across all workflows.
+    • Invalid if it looks like an email, code, number, or other junk string.
+    • Unusual all-caps or long free-text phrases can also indicate invalid data.
+- Safe SQL pattern:
+    COALESCE(NULLIF(TRIM(department),''), NULLIF(TRIM(owner_name),''), 'Department not specified')
+- When grouping by department (e.g., spend by department), always apply this fallback pattern so bad values don’t create false categories.
+- Never assume or hardcode a fixed list of department names; rely only on actual DB values and these validity rules.
 
 CONSTANTS:
 - Do NOT use parameter placeholders like %s. Inline constants as proper SQL string literals (escape ' by doubling).
@@ -317,18 +365,34 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             return _answer_with_rows(question,sql,cols,rows,intent)
 
     # ✅ Generic → GPT builds SQL (covers vendor/counterparty, clauses, and all other metadata analytics)
-    sql=ask_for_sql(question)
-    validate_sql_safe(sql)
+    try:
+        sql=ask_for_sql(question)
+        validate_sql_safe(sql)
 
-    # Safety net: if the model still used %s placeholders, auto-bind a single repeated parameter (e.g., vendor_term).
-    params: Optional[Tuple[Any,...]] = None
-    if "%s" in sql:
-        if intent.get("vendor_term"):
-            n = sql.count("%s")
-            params = tuple([intent["vendor_term"]] * n)
-        else:
-            # No safe param we can infer – better to error in dev than run wrong SQL
-            raise ValueError("Generated SQL is parameterized but no parameters were detected to bind.")
+        # Safety net: if the model still used %s placeholders, auto-bind a single repeated parameter (e.g., vendor_term).
+        params: Optional[Tuple[Any,...]] = None
+        if "%s" in sql:
+            if intent.get("vendor_term"):
+                n = sql.count("%s")
+                params = tuple([intent["vendor_term"]] * n)
+            else:
+                raise ValueError("Generated SQL is parameterized but no parameters were detected to bind.")
 
-    cols,rows=run_sql(sql, params)
-    return _answer_with_rows(question,sql,cols,rows,intent)
+        cols,rows=run_sql(sql, params)
+        return _answer_with_rows(question,sql,cols,rows,intent)
+
+    except Exception as e:
+        # Summarize error message for human-readable output
+        payload={
+            "question":question,
+            "sql":sql if 'sql' in locals() else "",
+            "error":str(e),
+            "intent":intent
+        }
+        return {
+            "sql":sql if 'sql' in locals() else "",
+            "columns":[],
+            "rows":[],
+            "stream":stream_summary_from_payload(payload),
+            "intent_json":intent
+        }
