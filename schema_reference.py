@@ -36,8 +36,28 @@ Table: workflows
   ✅ When grouping/displaying, wrap with COALESCE(legal_entity, 'Unspecified Legal Entity').
 
 - department (TEXT)
-  ✅ When grouping/displaying: COALESCE(department, 'Department not specified').
+  ✅ When grouping/displaying: use COALESCE(department, 'Department not specified').
   ✅ When filtering by user input: WHERE LOWER(department) = LOWER('<user_input>').
+  ⚠️ Department values in imported workflows may be messy due to OCR errors, typos, or personal names being stored instead of a true department.
+  ⚠️ ic.workflows.owner_name sometimes contains the real department when department is invalid.
+  
+  Department field cleanup:
+  - Use ic.workflows.department if it looks valid.
+  - If department looks like a personal name or junk value, fallback to owner_name.
+  - If both are invalid or NULL, categorize as 'Department not specified'.
+  
+  Validity checks (to decide if department is invalid):
+  • Looks like a personal name → two words, both capitalized (e.g., "MAGGIE SISTI").
+  • Appears only once or very rarely across all workflows (suggests bad OCR or typo).
+  • Contains characters/patterns unusual for a department (e.g., random all-caps, initials with dots, long free-text phrases).
+  • Matches an email address, number, or code instead of a department.
+  
+  SQL tips:
+  - Safe fallback pattern:
+      COALESCE(NULLIF(TRIM(department),''), NULLIF(TRIM(owner_name),''), 'Department not specified')
+  - For grouping and spend questions, use the fallback so invalid department values don’t inflate categories.
+  - Never assume a fixed list of valid departments; always rely on what exists in the database and apply the validity checks above.
+
 
 - owner_name (TEXT)
 - paper_source (TEXT)
@@ -67,6 +87,48 @@ Table: workflows
      Examples:
        WHERE LOWER(attributes->>'priority') = 'high priority'
        WHERE LOWER(attributes->>'priority') = 'medium/low priority'
+
+
+Approvals:
+- Approvals are stored in ic.approvals.
+- Link to ic.role_assignees ON workflow_id + role_id to resolve the actual user_name/email.
+- status values include 'approved', 'pending', etc.
+- To ask “How many contracts has [NAME] approved?”:
+    • Filter ra.user_name ILIKE '%Name%'
+    • AND a.status='approved'
+- To ask about pending approvals by person:
+    • Filter ra.user_name ILIKE '%Name%'
+    • AND a.status='pending'
+- Workflow scope:
+    • Completed workflows: w.status='completed'
+    • In-progress workflows: w.status='active'
+
+
+Quarter logic (calendar-aligned):
+- Q1 = Jan–Mar
+- Q2 = Apr–Jun
+- Q3 = Jul–Sep
+- Q4 = Oct–Dec
+
+Relative quarters (always based on CURRENT_DATE):
+- "Last quarter":
+    execution_date >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '3 months'
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE)
+- "This quarter":
+    execution_date >= date_trunc('quarter', CURRENT_DATE)
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+- "Next quarter":
+    execution_date >= date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '6 months'
+
+Explicit quarters (when user says Q1/Q2/Q3/Q4 YYYY):
+- Use EXTRACT(YEAR FROM execution_date)=YYYY
+  AND EXTRACT(QUARTER FROM execution_date)=N
+  (Q1=1, Q2=2, Q3=3, Q4=4)
+
+Important:
+- Do not approximate with “last 3 months.”
+- Always anchor to CURRENT_DATE and align with calendar quarters.
 
 Financial rules
 - “Spend/total spend” → use contract_value_amount only.
@@ -253,6 +315,22 @@ Examples:
     FROM ic.workflows
     WHERE attributes ? 'importId'
       AND attributes->'agreementTerm'->>'value' ILIKE '%one year%';
+
+-- Imported contract date logic
+- Imported contracts do not use created_at. Instead, use:
+    (attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+
+- To count or filter imported contracts by month:
+    SELECT DATE_TRUNC('month', (attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz) AS month,
+           COUNT(*)
+    FROM ic.workflows
+    WHERE attributes ? 'importId'
+      AND DATE_TRUNC('month', (attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz)
+          = DATE_TRUNC('month', DATE '2025-08-01')
+    GROUP BY month
+
+⚠️ Do NOT use HAVING with the alias "month".  
+Always repeat the DATE_TRUNC(...) expression in the WHERE clause when filtering by a specific month.
 
 -- Text search corpus + embeddings (for mention/snippet/semantic)
 Table: contract_texts
