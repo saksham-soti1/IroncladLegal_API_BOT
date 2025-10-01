@@ -36,27 +36,39 @@ Table: workflows
   ✅ When grouping/displaying, wrap with COALESCE(legal_entity, 'Unspecified Legal Entity').
 
 - department (TEXT)
-  ✅ When grouping/displaying: use COALESCE(department, 'Department not specified').
-  ✅ When filtering by user input: WHERE LOWER(department) = LOWER('<user_input>').
-  ⚠️ Department values in imported workflows may be messy due to OCR errors, typos, or personal names being stored instead of a true department.
-  ⚠️ ic.workflows.owner_name sometimes contains the real department when department is invalid.
-  
-  Department field cleanup:
-  - Use ic.workflows.department if it looks valid.
-  - If department looks like a personal name or junk value, fallback to owner_name.
-  - If both are invalid or NULL, categorize as 'Department not specified'.
-  
-  Validity checks (to decide if department is invalid):
-  • Looks like a personal name → two words, both capitalized (e.g., "MAGGIE SISTI").
-  • Appears only once or very rarely across all workflows (suggests bad OCR or typo).
-  • Contains characters/patterns unusual for a department (e.g., random all-caps, initials with dots, long free-text phrases).
-  • Matches an email address, number, or code instead of a department.
-  
-  SQL tips:
-  - Safe fallback pattern:
-      COALESCE(NULLIF(TRIM(department),''), NULLIF(TRIM(owner_name),''), 'Department not specified')
-  - For grouping and spend questions, use the fallback so invalid department values don’t inflate categories.
-  - Never assume a fixed list of valid departments; always rely on what exists in the database and apply the validity checks above.
+  ✅ When grouping or displaying, always normalize via department_map + department_canonical.
+  ✅ Use COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified') AS department_clean.
+  ✅ Join logic:
+      LEFT JOIN ic.department_map dm
+        ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
+      LEFT JOIN ic.department_canonical c1
+        ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
+      LEFT JOIN ic.department_canonical c2
+        ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
+  ✅ Always GROUP BY department_clean.
+  ⚠️ Prevents duplicates (e.g., 'CLINICAL' vs 'Clinical') and collapses bad OCR values into canonicals or 'Department not specified'.
+
+Recommended SQL patterns (metadata)
+- Spend by department (actuals only, with normalization):
+    SELECT
+      COALESCE(
+        dm.canonical_value,
+        c1.canonical_value,
+        c2.canonical_value,
+        'Department not specified'
+      ) AS department_clean,
+      COUNT(*) AS contracts,
+      SUM(w.contract_value_amount) AS total_value
+    FROM ic.workflows w
+    LEFT JOIN ic.department_map dm
+      ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
+    LEFT JOIN ic.department_canonical c1
+      ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
+    LEFT JOIN ic.department_canonical c2
+      ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
+    WHERE w.contract_value_amount IS NOT NULL
+    GROUP BY department_clean
+    ORDER BY total_value DESC NULLS LAST;
 
 
 - owner_name (TEXT)
