@@ -108,21 +108,30 @@ APPROVALS:
     • If question mentions “in progress” → add w.status='active'.
     • If question mentions “completed” → add w.status='completed'.
     • Otherwise default to all workflows (no filter on w.status).
-
 DEPARTMENT LOGIC:
-- Department values in ic.workflows may be messy, especially for imported workflows (OCR errors, typos, personal names).
-- Always prefer ic.workflows.department if it looks valid.
-- If department is invalid, fallback to ic.workflows.owner_name.
-- If both are invalid or NULL, use 'Department not specified'.
-- Validity checks for department:
-    • Likely a personal name if two words are both capitalized (e.g., "MAGGIE SISTI").
-    • Suspicious if the value appears only once or very rarely across all workflows.
-    • Invalid if it looks like an email, code, number, or other junk string.
-    • Unusual all-caps or long free-text phrases can also indicate invalid data.
-- Safe SQL pattern:
-    COALESCE(NULLIF(TRIM(department),''), NULLIF(TRIM(owner_name),''), 'Department not specified')
-- When grouping by department (e.g., spend by department), always apply this fallback pattern so bad values don’t create false categories.
-- Never assume or hardcode a fixed list of department names; rely only on actual DB values and these validity rules.
+- Department values may be messy, especially for imported workflows (OCR errors, typos, personal names).
+- Always normalize departments using both ic.department_map and ic.department_canonical.
+- SQL pattern when grouping or filtering by department:
+
+    SELECT
+      COALESCE(
+        dm.canonical_value,
+        c1.canonical_value,
+        c2.canonical_value,
+        'Department not specified'
+      ) AS department_clean,
+      COUNT(*) ...
+    FROM ic.workflows w
+    LEFT JOIN ic.department_map dm
+      ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
+    LEFT JOIN ic.department_canonical c1
+      ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
+    LEFT JOIN ic.department_canonical c2
+      ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
+
+- Always GROUP BY department_clean, never by raw department.
+- Never hardcode department names; rely only on mapping + canonical list.
+
 
 CONSTANTS:
 - Do NOT use parameter placeholders like %s. Inline constants as proper SQL string literals (escape ' by doubling).
@@ -164,10 +173,15 @@ def ask_for_sql(q:str)->str:
 # -----------------------------
 def build_summarizer_prompt()->str:
     return (
-        "You are a precise legal/contract analyst. Given the user's question and either SQL results or retrieved text, "
+        "You are a precise legal/contract analyst. "
+        "Given the user's question and either SQL results or retrieved text, "
         "write a concise, factual answer:\n"
-        "1) Direct Answer\n2) How it was computed\n3) Caveats\n"
+        "1) Direct Answer (must be based only on the provided data)\n"
+        "2) How it was computed (reference the SQL or text retrieval used)\n"
+        "3) Caveats (only mention limitations explicitly observable in the data or query, "
+        "never make up dates or external assumptions).\n"
     )
+
 
 def stream_summary_from_payload(payload:Dict[str,Any]):
     stream=client.chat.completions.create(
