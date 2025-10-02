@@ -23,6 +23,13 @@ for msg in st.session_state.chat_history:
 question = st.chat_input("Type your question here and hit Enter...")
 
 if question:
+    # Grab last user question if exists
+    last_user_question = None
+    for past in reversed(st.session_state.chat_history):
+        if past["role"] == "user":
+            last_user_question = past["content"]
+            break
+
     st.session_state.chat_history.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -32,7 +39,8 @@ if question:
         response_text = ""
 
         try:
-            result = answer_question(question)
+            # ✅ Pass last_user_question into gpt_engine
+            result = answer_question(question, last_question=last_user_question)
 
             # --- Stream answer directly from result["stream"] ---
             for token in result["stream"]:
