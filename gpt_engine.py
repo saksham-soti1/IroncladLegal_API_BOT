@@ -110,15 +110,14 @@ APPROVALS:
 STATUS HANDLING:
 - Approved approvals:
     • LOWER(a.status)='approved'
-    • Always filter with a.end_time (the approval decision time).
+    • Always filter with a.end_time (the decision time).
 - Pending approvals:
     • LOWER(a.status)='pending' AND a.end_time IS NULL
-    • Always require w.status='active' (pending approvals are only valid in in-progress workflows).
+    • Always require w.status='active' (pending approvals only exist on in-progress workflows).
 - Approver reassigned:
     • LOWER(a.status) LIKE 'approver reassigned%'.
 
-TIME WINDOWS:
-- Always anchor filters to CURRENT_DATE.
+TIME WINDOWS (always anchor to CURRENT_DATE):
 - Month:
     a.end_time >= date_trunc('month', CURRENT_DATE)
     AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
@@ -142,14 +141,21 @@ TIME WINDOWS:
 WORKFLOW SCOPE:
 - If user says “in progress” → add w.status='active'.
 - If user says “completed” → add w.status='completed'.
-- If user says “pending approval” → always require w.status='active'.
+- If the user says “pending approval” → require w.status='active'.
 - If no state specified → include all.
 
-ROLE-BASED QUERIES:
-- Always group by a.role_name (not ra.role_name).
+OUTPUT SHAPE (ABSOLUTE RULES):
+- Return **exactly one** SQL statement.
+- If the user asks “how many / count”, return a single scalar COUNT in one SELECT.
+- If the user asks “list / show / which”, return a single SELECT of rows (no COUNT, no extra statements).
+  Prefer columns:
+    w.workflow_id, w.readable_id, w.title
+  Optionally include: a.role_name, a.start_time, a.end_time
+  Order by a.end_time DESC (for approved) or a.start_time DESC (for pending), and LIMIT 100.
 
 EXAMPLES:
--- Approved by Adam (all time)
+
+-- Count: approved by Adam (all time)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
 JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
@@ -157,7 +163,19 @@ JOIN ic.workflows w ON w.workflow_id=a.workflow_id
 WHERE LOWER(a.status)='approved'
   AND (LOWER(ra.user_name) ILIKE '%adam%' OR LOWER(ra.email) ILIKE '%adam%');
 
--- Pending approvals for Stephanie (in progress workflows only)
+-- List: approved by Adam in the last 3 months (rows, not count)
+SELECT w.workflow_id, w.readable_id, w.title, a.role_name, a.end_time
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND (LOWER(ra.user_name) ILIKE '%adam%' OR LOWER(ra.email) ILIKE '%adam%')
+  AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
+  AND a.end_time <  CURRENT_DATE
+ORDER BY a.end_time DESC
+LIMIT 100;
+
+-- Count: pending approvals for Stephanie (active workflows only)
 SELECT COUNT(DISTINCT a.workflow_id) AS pending_workflows
 FROM ic.approval_requests a
 JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
@@ -166,6 +184,18 @@ WHERE LOWER(a.status)='pending'
   AND a.end_time IS NULL
   AND w.status='active'
   AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
+
+-- List: pending approvals for Stephanie (rows, not count)
+SELECT w.workflow_id, w.readable_id, w.title, a.role_name, a.start_time
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='pending'
+  AND a.end_time IS NULL
+  AND w.status='active'
+  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%')
+ORDER BY a.start_time DESC
+LIMIT 100;
 
 
 
@@ -272,9 +302,18 @@ Guidelines:
 FOLLOWUP_MERGE_PROMPT = """
 You are a question rewriter. Given the previous user question (Last) and the current follow-up (Now),
 rewrite them into ONE clear standalone question that does not rely on prior context.
-Keep all important filters (names, dates, workflow states, contract types). Do NOT invent new info.
-Output ONLY the rewritten question as plain text.
+
+CRITICAL:
+- Preserve the TASK TYPE from the Now message.
+  • If Now asks to "list/show/which/return rows", the merged question MUST ask to list rows (not count).
+  • If Now asks "how many/count", the merged question MUST ask for a count (not a list).
+  • If Now asks to "compare/summarize", preserve that action.
+
+- Keep all important filters from Last and Now (names, dates, workflow states, contract types, vendors, etc.).
+- Do NOT invent new information.
+- Output ONLY the rewritten question as plain text (no explanations).
 """
+
 
 def is_followup(last_q: str, current_q: str) -> bool:
     if not last_q or not current_q: 
