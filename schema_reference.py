@@ -100,20 +100,116 @@ Recommended SQL patterns (metadata)
        WHERE LOWER(attributes->>'priority') = 'high priority'
        WHERE LOWER(attributes->>'priority') = 'medium/low priority'
 
+Approvals (ic.approval_requests):
+- Each row = one approval request/decision with start_time, end_time, status, role_id, role_name.
+- Join to ic.role_assignees (ra) ON workflow_id + role_id to resolve user_name/email.
+- Join to ic.workflows (w) for workflow status (active/completed).
+- Person matching must be broad and case-insensitive:
+    • (LOWER(ra.user_name) ILIKE '%'||LOWER('<term>')||'%' OR LOWER(ra.email) ILIKE '%'||LOWER('<term>')||'%')
+    • Supports partial names (first name, last name, or email).
+- Always normalize with LOWER(a.status).
 
-Approvals:
-- Approvals are stored in ic.approvals.
-- Link to ic.role_assignees ON workflow_id + role_id to resolve the actual user_name/email.
-- status values include 'approved', 'pending', etc.
-- To ask “How many contracts has [NAME] approved?”:
-    • Filter ra.user_name ILIKE '%Name%'
-    • AND a.status='approved'
-- To ask about pending approvals by person:
-    • Filter ra.user_name ILIKE '%Name%'
-    • AND a.status='pending'
-- Workflow scope:
-    • Completed workflows: w.status='completed'
-    • In-progress workflows: w.status='active'
+Status values:
+- Approved approvals:
+    • LOWER(a.status)='approved'
+    • Always filter with a.end_time (the approval decision time).
+- Pending approvals:
+    • LOWER(a.status)='pending' AND a.end_time IS NULL
+    • Always require w.status='active' (pending approvals are only valid in in-progress workflows).
+- Approver reassigned:
+    • LOWER(a.status) LIKE 'approver reassigned%'.
+
+Time windows (always anchor to CURRENT_DATE):
+- Month:
+    a.end_time >= date_trunc('month', CURRENT_DATE)
+    AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+- Last 3 months (rolling):
+    a.end_time >= CURRENT_DATE - INTERVAL '3 months'
+    AND a.end_time <  CURRENT_DATE
+- Last 6 months (rolling):
+    a.end_time >= CURRENT_DATE - INTERVAL '6 months'
+    AND a.end_time <  CURRENT_DATE
+- Quarter (calendar aligned):
+    a.end_time >= date_trunc('quarter', CURRENT_DATE)
+    AND a.end_time <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+- Year (calendar aligned):
+    a.end_time >= date_trunc('year', CURRENT_DATE)
+    AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+- Week:
+    a.end_time >= CURRENT_DATE - INTERVAL '7 days'
+    AND a.end_time < CURRENT_DATE
+- If no timeframe is given → no date filter.
+
+Workflow scope:
+- If user says “in progress” → add w.status='active'.
+- If user says “completed” → add w.status='completed'.
+- If user says “pending approval” → always require w.status='active'.
+- If no state specified → include all.
+
+Role-based queries:
+- Always group by a.role_name (not ra.role_name).
+
+Examples:
+
+-- Approvals by Jane Doe all time
+SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%');
+
+-- Approvals by Jane Doe this month
+SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
+  AND a.end_time >= date_trunc('month', CURRENT_DATE)
+  AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month';
+
+-- Approvals by Jane Doe last 3 months (rolling window)
+SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
+  AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
+  AND a.end_time < CURRENT_DATE;
+
+-- Pending approvals for Stephanie/Use logic for anyone else (in-progress workflows only)
+SELECT COUNT(DISTINCT a.workflow_id) AS pending_workflows
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra 
+  ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w 
+  ON w.workflow_id = a.workflow_id
+WHERE LOWER(a.status) = 'pending'
+  AND a.end_time IS NULL
+  AND w.status = 'active'
+  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
+
+-- Roles by approval count (this year)
+SELECT a.role_name, COUNT(DISTINCT a.workflow_id) AS approvals
+FROM ic.approval_requests a
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND a.end_time >= date_trunc('year', CURRENT_DATE)
+  AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+GROUP BY a.role_name
+ORDER BY approvals DESC;
+
+-- Approver reassigned events by role
+SELECT a.role_name, COUNT(*) AS reassigned
+FROM ic.approval_requests a
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status) LIKE 'approver reassigned%'
+GROUP BY a.role_name
+ORDER BY reassigned DESC;
+
+
 
 
 Quarter logic (calendar-aligned):
