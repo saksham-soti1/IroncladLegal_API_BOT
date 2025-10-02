@@ -101,13 +101,75 @@ QUARTER WINDOWS:
 - The current year is 2025. 
 
 APPROVALS:
-- Always join ic.approvals (a) with ic.role_assignees (ra) ON workflow_id + role_id to resolve user_name.
-- For “[NAME] approved contracts”: filter ra.user_name ILIKE '%Name%' AND a.status='approved'.
-- For “[NAME] pending approvals”: filter ra.user_name ILIKE '%Name%' AND a.status='pending'.
-- Workflow scope:
-    • If question mentions “in progress” → add w.status='active'.
-    • If question mentions “completed” → add w.status='completed'.
-    • Otherwise default to all workflows (no filter on w.status).
+- Use ic.approval_requests (alias a). Each row = one approval request/decision.
+- Join with ic.role_assignees (ra) ON (workflow_id, role_id) to resolve user_name/email.
+- Join with ic.workflows (w) for workflow status.
+- Person matching MUST be broad and case-insensitive:
+    • (LOWER(ra.user_name) ILIKE '%'||LOWER('<term>')||'%' OR LOWER(ra.email) ILIKE '%'||LOWER('<term>')||'%')
+
+STATUS HANDLING:
+- Approved approvals:
+    • LOWER(a.status)='approved'
+    • Always filter with a.end_time (the approval decision time).
+- Pending approvals:
+    • LOWER(a.status)='pending' AND a.end_time IS NULL
+    • Always require w.status='active' (pending approvals are only valid in in-progress workflows).
+- Approver reassigned:
+    • LOWER(a.status) LIKE 'approver reassigned%'.
+
+TIME WINDOWS:
+- Always anchor filters to CURRENT_DATE.
+- Month:
+    a.end_time >= date_trunc('month', CURRENT_DATE)
+    AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+- Last 3 months (rolling):
+    a.end_time >= CURRENT_DATE - INTERVAL '3 months'
+    AND a.end_time <  CURRENT_DATE
+- Last 6 months (rolling):
+    a.end_time >= CURRENT_DATE - INTERVAL '6 months'
+    AND a.end_time <  CURRENT_DATE
+- Quarter (calendar aligned):
+    a.end_time >= date_trunc('quarter', CURRENT_DATE)
+    AND a.end_time <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
+- Year (calendar aligned):
+    a.end_time >= date_trunc('year', CURRENT_DATE)
+    AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+- Week:
+    a.end_time >= CURRENT_DATE - INTERVAL '7 days'
+    AND a.end_time < CURRENT_DATE
+- If no timeframe is given → do not filter on dates.
+
+WORKFLOW SCOPE:
+- If user says “in progress” → add w.status='active'.
+- If user says “completed” → add w.status='completed'.
+- If user says “pending approval” → always require w.status='active'.
+- If no state specified → include all.
+
+ROLE-BASED QUERIES:
+- Always group by a.role_name (not ra.role_name).
+
+EXAMPLES:
+-- Approved by Adam (all time)
+SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='approved'
+  AND (LOWER(ra.user_name) ILIKE '%adam%' OR LOWER(ra.email) ILIKE '%adam%');
+
+-- Pending approvals for Stephanie (in progress workflows only)
+SELECT COUNT(DISTINCT a.workflow_id) AS pending_workflows
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
+JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+WHERE LOWER(a.status)='pending'
+  AND a.end_time IS NULL
+  AND w.status='active'
+  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
+
+
+
+
 DEPARTMENT LOGIC:
 - Department values may be messy, especially for imported workflows (OCR errors, typos, personal names).
 - Always normalize departments using both ic.department_map and ic.department_canonical.
@@ -182,7 +244,6 @@ def build_summarizer_prompt()->str:
         "never make up dates or external assumptions).\n"
     )
 
-
 def stream_summary_from_payload(payload:Dict[str,Any]):
     stream=client.chat.completions.create(
         model="gpt-4o-mini",temperature=0,
@@ -194,6 +255,50 @@ def stream_summary_from_payload(payload:Dict[str,Any]):
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
+
+# -----------------------------
+# Follow-up Detection + Merge (NEW)
+# -----------------------------
+FOLLOWUP_DETECT_PROMPT = """
+You are a classifier that determines if a user's new question is a follow-up to their last question in a conversation.
+You must respond ONLY with JSON in the format: {"followup": true} or {"followup": false}
+
+Guidelines:
+- A follow-up depends on the previous question’s context (pronouns, vague references like "them", "those", "what about", "list them", "show the ones", etc.).
+- If the new question is complete and clear on its own, mark followup=false.
+- If uncertain, choose false. Do not hallucinate.
+"""
+
+FOLLOWUP_MERGE_PROMPT = """
+You are a question rewriter. Given the previous user question (Last) and the current follow-up (Now),
+rewrite them into ONE clear standalone question that does not rely on prior context.
+Keep all important filters (names, dates, workflow states, contract types). Do NOT invent new info.
+Output ONLY the rewritten question as plain text.
+"""
+
+def is_followup(last_q: str, current_q: str) -> bool:
+    if not last_q or not current_q: 
+        return False
+    msgs = [
+        {"role":"system","content":FOLLOWUP_DETECT_PROMPT},
+        {"role":"user","content":f"Last: {last_q}\nNow: {current_q}"}
+    ]
+    resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=msgs)
+    content = (resp.choices[0].message.content or "{}").strip()
+    try:
+        js = json.loads(content)
+        return bool(js.get("followup", False))
+    except Exception:
+        return False
+
+def merge_followup(last_q: str, current_q: str) -> str:
+    msgs = [
+        {"role":"system","content":FOLLOWUP_MERGE_PROMPT},
+        {"role":"user","content":f"Last: {last_q}\nNow: {current_q}"}
+    ]
+    resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=msgs)
+    merged = (resp.choices[0].message.content or current_q).strip()
+    return merged if merged else current_q
 
 # -----------------------------
 # Intent classification
@@ -320,7 +425,50 @@ def _not_frag(alias,terms):
 # -----------------------------
 # Main router
 # -----------------------------
-def answer_question(question:str)->Dict[str,Any]:
+
+
+def _count_unquoted_percent_s(sql: str) -> int:
+    """
+    Counts %s placeholders that are OUTSIDE single-quoted string literals.
+    Treats doubled quotes ('') as an escaped single quote.
+    """
+    count = 0
+    in_single = False
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            if in_single:
+                # handle doubled single quote '' inside string literal
+                if i + 1 < n and sql[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+                i += 1
+                continue
+            else:
+                in_single = True
+                i += 1
+                continue
+        # Only count %s when NOT inside a string literal
+        if not in_single and ch == "%" and i + 1 < n and sql[i + 1] == "s":
+            count += 1
+            i += 2
+            continue
+        i += 1
+    return count
+
+def answer_question(question:str, last_question: Optional[str] = None)->Dict[str,Any]:
+    # NEW: follow-up preprocessing (safe no-op if last_question is None)
+    if last_question:
+        try:
+            if is_followup(last_question, question):
+                question = merge_followup(last_question, question)
+        except Exception:
+            # Fail-safe: if detection/merge errors, continue with original question
+            pass
+
     intent=classify_intent(question)
 
     # Summarize (RAG)
@@ -384,13 +532,17 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
         validate_sql_safe(sql)
 
         # Safety net: if the model still used %s placeholders, auto-bind a single repeated parameter (e.g., vendor_term).
-        params: Optional[Tuple[Any,...]] = None
-        if "%s" in sql:
+        # Safety net: bind parameters ONLY if there are unquoted %s placeholders
+        params: Optional[Tuple[Any, ...]] = None
+        unquoted_count = _count_unquoted_percent_s(sql)
+        if unquoted_count > 0:
             if intent.get("vendor_term"):
-                n = sql.count("%s")
-                params = tuple([intent["vendor_term"]] * n)
+                params = tuple([intent["vendor_term"]] * unquoted_count)
             else:
-                raise ValueError("Generated SQL is parameterized but no parameters were detected to bind.")
+                raise ValueError(
+                    "Generated SQL contains unbound %s placeholders outside of string literals, "
+                    "but no parameters were provided to bind."
+                )
 
         cols,rows=run_sql(sql, params)
         return _answer_with_rows(question,sql,cols,rows,intent)
@@ -409,4 +561,16 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "rows":[],
             "stream":stream_summary_from_payload(payload),
             "intent_json":intent
+        }
+
+    return {
+            "sql": "",
+            "columns": [],
+            "rows": [],
+            "stream": stream_summary_from_payload({
+                "question": question,
+                "error": "Unhandled query path reached with no output",
+                "intent": intent
+            }),
+            "intent_json": intent
         }
