@@ -35,21 +35,15 @@ Table: workflows
 - legal_entity (TEXT)
   ✅ When grouping/displaying, wrap with COALESCE(legal_entity, 'Unspecified Legal Entity').
 
-- department (TEXT)
-  ✅ When grouping or displaying, always normalize via department_map + department_canonical.
-  ✅ Use COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified') AS department_clean.
-  ✅ Join logic:
-      LEFT JOIN ic.department_map dm
-        ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
-      LEFT JOIN ic.department_canonical c1
-        ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
-      LEFT JOIN ic.department_canonical c2
-        ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
-  ✅ Always GROUP BY department_clean.
-  ⚠️ Prevents duplicates (e.g., 'CLINICAL' vs 'Clinical') and collapses bad OCR values into canonicals or 'Department not specified'.
+DEPARTMENT LOGIC:
+- Department values may be messy, especially for imported workflows (OCR errors, typos, personal names).
+- Always normalize departments using both ic.department_map and ic.department_canonical.
+- If the department cannot be resolved, label it as 'Department not specified'.
+- 'Department not specified' = imported contracts or workflows that do not have a department field stored in Ironclad.
+- Never use raw ILIKE matching on department names. Always resolve through canonical mapping.
 
-Recommended SQL patterns (metadata)
-- Spend by department (actuals only, with normalization):
+- SQL pattern when grouping or filtering by department:
+
     SELECT
       COALESCE(
         dm.canonical_value,
@@ -57,8 +51,7 @@ Recommended SQL patterns (metadata)
         c2.canonical_value,
         'Department not specified'
       ) AS department_clean,
-      COUNT(*) AS contracts,
-      SUM(w.contract_value_amount) AS total_value
+      COUNT(*) ...
     FROM ic.workflows w
     LEFT JOIN ic.department_map dm
       ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
@@ -66,9 +59,18 @@ Recommended SQL patterns (metadata)
       ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
     LEFT JOIN ic.department_canonical c2
       ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
-    WHERE w.contract_value_amount IS NOT NULL
-    GROUP BY department_clean
-    ORDER BY total_value DESC NULLS LAST;
+    WHERE w.created_at >= date_trunc('month', CURRENT_DATE)
+      AND w.created_at < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      AND COALESCE(
+        dm.canonical_value,
+        c1.canonical_value,
+        c2.canonical_value,
+        'Department not specified'
+      ) = 'IT'
+
+- Always GROUP BY department_clean, never by raw department.
+- Never hardcode department names; rely only on mapping + canonical list.
+
 
 
 - owner_name (TEXT)
