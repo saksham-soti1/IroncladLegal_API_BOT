@@ -211,6 +211,7 @@ DEPARTMENT LOGIC:
 - Always normalize departments using both ic.department_map and ic.department_canonical.
 - If the department cannot be resolved, label it as 'Department not specified'.
 - 'Department not specified' = imported contracts or workflows that do not have a department field stored in Ironclad.
+- Never use raw ILIKE matching on department names. Always resolve through canonical mapping.
 
 - SQL pattern when grouping or filtering by department:
 
@@ -229,9 +230,18 @@ DEPARTMENT LOGIC:
       ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
     LEFT JOIN ic.department_canonical c2
       ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
+    WHERE w.created_at >= date_trunc('month', CURRENT_DATE)
+      AND w.created_at < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+      AND COALESCE(
+        dm.canonical_value,
+        c1.canonical_value,
+        c2.canonical_value,
+        'Department not specified'
+      ) = 'IT'
 
 - Always GROUP BY department_clean, never by raw department.
 - Never hardcode department names; rely only on mapping + canonical list.
+
 
 
 CONSTANTS:
@@ -303,11 +313,39 @@ FOLLOWUP_DETECT_PROMPT = """
 You are a classifier that determines if a user's new question is a follow-up to their last question in a conversation.
 You must respond ONLY with JSON in the format: {"followup": true} or {"followup": false}
 
-Guidelines:
-- A follow-up depends on the previous question’s context (pronouns, vague references like "them", "those", "what about", "list them", "show the ones", etc.).
-- If the new question is complete and clear on its own, mark followup=false.
-- If uncertain, choose false. Do not hallucinate.
+Rules:
+- A follow-up = ONLY if the new question is incomplete or ambiguous without the previous one.
+- If the new question introduces its own subject (contracts, workflows, clauses, department, timeframe, etc.), treat it as standalone (followup=false).
+- Similar topics (same department, same timeframe) do NOT make it a follow-up if the question is otherwise complete.
+- If uncertain, return {"followup": false}.
+
+Examples of true follow-ups:
+Last: "How many workflows are pending Stephanie’s approval?"
+Now: "List them"
+→ {"followup": true}
+
+Last: "Show me the NDAs signed in Q2 2024"
+Now: "What about MSAs?"
+→ {"followup": true}
+
+Last: "How many contracts were executed last quarter?"
+Now: "List them"
+→ {"followup": true}
+
+Examples of NOT follow-ups (standalone questions):
+Last: "How many workflows has IT created this month?"
+Now: "How many contracts has IT created in the last 30 days?"
+→ {"followup": false}
+
+Last: "Summarize IC-1001"
+Now: "Summarize IC-1002"
+→ {"followup": false}
+
+Last: "Which contracts mention indemnification?"
+Now: "Which contracts mention liability?"
+→ {"followup": false}
 """
+
 
 FOLLOWUP_MERGE_PROMPT = """
 You are a question rewriter. Given the previous user question (Last) and the current follow-up (Now),
