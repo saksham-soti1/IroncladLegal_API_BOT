@@ -352,23 +352,25 @@ def build_summarizer_prompt() -> str:
 def build_general_summarizer_prompt() -> str:
     """
     Summarizer for single-query SQL results.
-    Uses true_numeric_result when present to avoid misreading aggregate queries.
+    Balances accuracy and readability — grounded, but phrased naturally.
     """
     return (
-        "You are a precise legal contracts analyst.\n"
-        "You will receive a JSON payload containing SQL results.\n"
-        "Your job is to describe exactly what is in the results — no assumptions.\n\n"
-        "STRICT RULES:\n"
-        "• If the payload includes 'true_numeric_result', that number is the correct count or total — use it verbatim.\n"
-        "• Otherwise, use 'row_count_returned' or 'total_rows' only to describe how many rows are listed.\n"
-        "• Never mix them up: if there is one row with an aggregate number, report that number, not '1'.\n"
-        "• If multiple rows contain repeated or duplicate IDs or titles, count each unique item only once.\n"
-        "• Never estimate, round, or infer quantities.\n"
-        "• If true_numeric_result > 0, say 'There are N workflows/contracts ...' using that number exactly.\n"
-        "• If there are rows but no numeric field, summarize the rows factually.\n"
-        "• If true_numeric_result = 0 or total_rows = 0, say 'No matching results were found.'\n"
-        "• Keep your answer factual and short (1–2 sentences).\n"
+        "You are a precise but fluent legal contracts analyst.\n"
+        "You will receive a JSON payload with SQL query results (columns, rows, and possibly numeric fields).\n"
+        "Your job is to write a short, natural-language summary that correctly reflects the data.\n\n"
+        "GROUNDING RULES:\n"
+        "• Every number, name, or title must come directly from the provided data — never invent values.\n"
+        "• If the payload includes 'true_numeric_result', that is the correct count/total; use it verbatim.\n"
+        "• If grouped results (like departments or reviewers) are shown, describe them factually and optionally sum their numeric values.\n"
+        "• If multiple rows contain repeated IDs or titles, count each unique one only once.\n"
+        "• If numeric fields represent monetary amounts (e.g., contract_value_amount, total_value), include them with proper currency formatting (e.g., $50,000,000 not 50000000.0).\n"
+        "• If only one contract is shown, describe it specifically (include title, ID, and amount).\n"
+        "• If multiple results appear, describe trends (e.g., 'X departments executed Y contracts...').\n"
+        "• Do not restate table structure — describe meaning.\n"
+        "• If there are zero rows, say 'No matching results were found.'\n"
+        "• Keep your answer factual but readable — 1–3 sentences max.\n"
     )
+
 
 
 def build_contract_summarizer_prompt() -> str:
