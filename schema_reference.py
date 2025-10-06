@@ -526,4 +526,188 @@ Notes:
     )
 
 - Do not attempt: ARRAY_AGG(readable_id ORDER BY readable_id LIMIT 5)  ← this will error.
+
+-- =========================
+-- WEEKLY REPORT AND LEGAL METRICS
+-- =========================
+When a user asks about:
+- "weekly report"
+- "this week's report"
+- "legal team report"
+- "weekly metrics"
+- "generate report"
+or any question that implies the user wants a summary of Legal/contract activity for the past week or similar time window,
+the model should compose and execute the following queries (individually, in order) and summarize the results as a structured report.
+
+The report covers rolling windows relative to CURRENT_DATE.
+
+1. Contracts Completed with Legal Review (Last 14 Days)
+    SELECT COUNT(DISTINCT w.workflow_id) AS contracts_completed_with_named_legal_review
+    FROM ic.workflows w
+    WHERE w.status = 'completed'
+      AND w.execution_date >= CURRENT_DATE - INTERVAL '14 days'
+      AND w.execution_date < CURRENT_DATE
+      AND EXISTS (
+        SELECT 1
+        FROM ic.approval_requests a
+        JOIN ic.role_assignees ra
+          ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+        WHERE a.workflow_id = w.workflow_id
+          AND LOWER(a.status) = 'approved'
+          AND (
+            LOWER(ra.user_name) ILIKE '%beverly dale%'
+            OR LOWER(ra.user_name) ILIKE '%karen lo%'
+            OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+            OR LOWER(ra.user_name) ILIKE '%pat higgins%'
+            OR LOWER(ra.email) ILIKE '%beverly%'
+            OR LOWER(ra.email) ILIKE '%karen%'
+            OR LOWER(ra.email) ILIKE '%stephanie%'
+            OR LOWER(ra.email) ILIKE '%higgins%'
+          )
+      );
+
+2. New Contracts Assigned to Legal (Last 14 Days)
+    SELECT COUNT(DISTINCT a.workflow_id) AS new_contracts_assigned_to_legal
+    FROM ic.approval_requests a
+    JOIN ic.role_assignees ra
+      ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+    JOIN ic.workflows w
+      ON w.workflow_id = a.workflow_id
+    WHERE a.start_time >= CURRENT_DATE - INTERVAL '14 days'
+      AND a.start_time < CURRENT_DATE
+      AND LOWER(w.status) IN ('active','completed')
+      AND (
+        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        OR LOWER(ra.user_name) ILIKE '%karen lo%'
+        OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+        OR LOWER(ra.user_name) ILIKE '%pat higgins%'
+        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%karen%'
+        OR LOWER(ra.email) ILIKE '%stephanie%'
+        OR LOWER(ra.email) ILIKE '%higgins%'
+      );
+
+3. Total Contracts Going Through Ironclad (Last 14 Days)
+    SELECT COUNT(*) AS total_contracts_in_ironclad_last_14_days
+    FROM ic.workflows
+    WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
+      AND created_at < CURRENT_DATE
+      AND LOWER(status) IN ('active','completed');
+
+4. Active Contracts Created Over 90 Days Ago
+    SELECT COUNT(*) AS active_contracts_created_over_90_days_ago
+    FROM ic.workflows
+    WHERE created_at < CURRENT_DATE - INTERVAL '90 days'
+      AND LOWER(status) = 'active';
+
+5. Contracts with No Activity Over 90 Days
+    SELECT COUNT(*) AS contracts_no_activity_over_90_days
+    FROM ic.workflows
+    WHERE last_updated_at < CURRENT_DATE - INTERVAL '90 days'
+      AND LOWER(status) IN ('active','paused');
+
+6. Active NDAs Created in Last 14 Days
+    SELECT COUNT(*) AS active_ndas_last_14_days
+    FROM ic.workflows
+    WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
+      AND created_at < CURRENT_DATE
+      AND LOWER(status) = 'active'
+      AND LOWER(title) LIKE '%nda%';
+
+7. Weekly Legal Team – Contracts Completed by Reviewer (Last 14 Days)
+    SELECT ra.user_name AS reviewer_name,
+           COUNT(DISTINCT w.workflow_id) AS contracts_completed_last_14_days
+    FROM ic.workflows w
+    JOIN ic.approval_requests a ON a.workflow_id = w.workflow_id
+    JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+    WHERE w.status = 'completed'
+      AND w.execution_date >= CURRENT_DATE - INTERVAL '14 days'
+      AND w.execution_date < CURRENT_DATE
+      AND LOWER(a.status) = 'approved'
+      AND (
+        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        OR LOWER(ra.user_name) ILIKE '%karen lo%'
+        OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+        OR LOWER(ra.user_name) ILIKE '%pat higgins%'
+        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%karen%'
+        OR LOWER(ra.email) ILIKE '%stephanie%'
+        OR LOWER(ra.email) ILIKE '%higgins%'
+      )
+    GROUP BY ra.user_name
+    ORDER BY contracts_completed_last_14_days DESC;
+
+8. Weekly Legal Team – New Contracts Assigned by Reviewer (Last 14 Days)
+    SELECT ra.user_name AS reviewer_name,
+           COUNT(DISTINCT a.workflow_id) AS new_contracts_assigned_last_14_days
+    FROM ic.approval_requests a
+    JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+    JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+    WHERE a.start_time >= CURRENT_DATE - INTERVAL '14 days'
+      AND a.start_time < CURRENT_DATE
+      AND LOWER(w.status) IN ('active','completed')
+      AND (
+        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        OR LOWER(ra.user_name) ILIKE '%karen lo%'
+        OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+        OR LOWER(ra.user_name) ILIKE '%pat higgins%'
+        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%karen%'
+        OR LOWER(ra.email) ILIKE '%stephanie%'
+        OR LOWER(ra.email) ILIKE '%higgins%'
+      )
+    GROUP BY ra.user_name
+    ORDER BY new_contracts_assigned_last_14_days DESC;
+
+9. Work in Progress by Department
+    SELECT COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean,
+           COUNT(*) AS workflow_count
+    FROM ic.workflows w
+    LEFT JOIN ic.department_map dm ON UPPER(TRIM(w.department))=UPPER(dm.raw_value)
+    LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(w.department))=UPPER(c1.canonical_value)
+    LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(w.owner_name))=UPPER(c2.canonical_value)
+    WHERE LOWER(w.status) IN ('active','paused')
+    GROUP BY department_clean
+    ORDER BY workflow_count DESC;
+
+10. Work Completed by Department (Past 12 Months)
+    SELECT department_clean,
+           COUNT(DISTINCT workflow_id) AS workflows_completed_last_year
+    FROM (
+      SELECT w.workflow_id,
+             COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean
+      FROM ic.workflows w
+      LEFT JOIN ic.department_map dm ON UPPER(TRIM(w.department))=UPPER(dm.raw_value)
+      LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(w.department))=UPPER(c1.canonical_value)
+      LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(w.owner_name))=UPPER(c2.canonical_value)
+      WHERE w.execution_date >= CURRENT_DATE - INTERVAL '12 months'
+        AND LOWER(w.status)='completed'
+    ) x
+    GROUP BY department_clean
+    ORDER BY workflows_completed_last_year DESC NULLS LAST;
+
+11. Work Completed by Sum of Contract Value (Past 12 Months)
+    SELECT department_clean,
+           SUM(contract_value_amount) AS total_contract_value_last_year
+    FROM (
+      SELECT w.workflow_id,
+             COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean,
+             w.contract_value_amount
+      FROM ic.workflows w
+      LEFT JOIN ic.department_map dm ON UPPER(TRIM(w.department))=UPPER(dm.raw_value)
+      LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(w.department))=UPPER(c1.canonical_value)
+      LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(w.owner_name))=UPPER(c2.canonical_value)
+      WHERE w.execution_date >= CURRENT_DATE - INTERVAL '12 months'
+        AND LOWER(w.status)='completed'
+        AND w.contract_value_amount IS NOT NULL
+    ) x
+    GROUP BY department_clean
+    ORDER BY total_contract_value_last_year DESC NULLS LAST;
+
+Formatting guidance:
+- Present results as a single weekly report summary.
+- Include section headers and concise explanations.
+- Output counts and totals clearly.
+- Mention timeframes (e.g., “last 14 days”, “past 12 months”).
+- Use plain English, not just raw SQL output.
 """
