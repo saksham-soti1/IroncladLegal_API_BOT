@@ -45,8 +45,10 @@ if question:
             # --- Stream answer directly from result["stream"] ---
             for token in result["stream"]:
                 response_text += token
-                response_container.markdown(response_text + "▌")
-            response_container.markdown(response_text)
+                response_container.markdown(f"**{response_text}▌**")
+            response_container.markdown(f"**{response_text}**")
+
+
 
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": response_text}
@@ -54,18 +56,17 @@ if question:
             st.session_state.last_sql = result["sql"]
 
             # --- Show SQL + table preview ---
-            st.markdown("### Generated SQL")
-            st.code(result["sql"], language="sql")
+            # --- Collapsible Generated SQL ---
+            with st.expander("📄 Generated SQL", expanded=False):
+                st.code(result["sql"], language="sql")
 
+            # --- Optional table preview ---
             if result["rows"]:
                 df = pd.DataFrame(result["rows"], columns=result["columns"])
                 st.dataframe(df, use_container_width=True)
             else:
                 st.info("No rows returned.")
 
-            # --- Debug: show classifier output ---
-            with st.expander("🔍 Intent JSON (debug)"):
-                st.code(json.dumps(result.get("intent_json", {}), indent=2), language="json")
 
         except Exception as e:
             error_msg = f"Error: {e}"
