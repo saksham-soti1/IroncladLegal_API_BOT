@@ -247,6 +247,51 @@ Financial rules
 - Currency handling:
   If summing across multiple currencies, either group by currency or state that totals mix currencies.
 
+-- Duration & Average Time Calculations
+When a user asks about:
+- “average time to complete a contract”
+- “average time from creation to execution”
+- “average lifecycle duration”
+- “average created-to-completed days”
+or any similar timing or duration metric,
+always compute the difference between execution_date (end of workflow) and created_at (start of workflow).
+
+Use this pattern (returns average number of days):
+
+    SELECT
+        ROUND(AVG(EXTRACT(EPOCH FROM (execution_date - created_at)) / 86400)::numeric, 2)
+        AS average_days_to_complete
+    FROM ic.workflows
+    WHERE status = 'completed'
+      AND execution_date IS NOT NULL
+      AND created_at IS NOT NULL;
+
+Alternate representation (if an interval is requested instead of numeric days):
+
+    SELECT
+        justify_interval(AVG(execution_date - created_at)) AS average_duration
+    FROM ic.workflows
+    WHERE status = 'completed'
+      AND execution_date IS NOT NULL
+      AND created_at IS NOT NULL;
+
+Guidance:
+- Use execution_date for all “completed”/“signed”/“executed”/“finished” timestamps.
+- Never use workflow_completed_at (not present in schema).
+- Exclude NULL timestamps with “IS NOT NULL”.
+- Default output should be in days (numeric, rounded to 2 decimals).
+- If the user explicitly asks for formatted time (days + hours), use the justify_interval version.
+
+To compute shortest or longest contract duration:
+
+    SELECT
+        MIN(EXTRACT(EPOCH FROM (execution_date - created_at)) / 86400) AS min_days,
+        MAX(EXTRACT(EPOCH FROM (execution_date - created_at)) / 86400) AS max_days
+    FROM ic.workflows
+    WHERE status = 'completed'
+      AND execution_date IS NOT NULL
+      AND created_at IS NOT NULL;
+
 Recommended SQL patterns (metadata)
 - Spend by department (actuals only):
     SELECT
