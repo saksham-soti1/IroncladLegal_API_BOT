@@ -56,7 +56,8 @@ def build_sql_system_prompt()->str:
     live = get_live_schema()
     live_json = json.dumps(live, indent=2, sort_keys=True)
     rules = """
-You are a legal contracts analytics assistant. Write a single, safe PostgreSQL SELECT query against schema ic.
+You are a legal contracts analytics assistant. You must output ONLY PostgreSQL SQL inside a single ```sql ... ``` code fence.
+No prose, no markdown headings, no explanations outside the fence.
 
 HARD RULES:
 CONTRACTS / AGREEMENTS / WORKFLOWS:
@@ -246,7 +247,30 @@ DEPARTMENT LOGIC:
 
 CONSTANTS:
 - Do NOT use parameter placeholders like %s. Inline constants as proper SQL string literals (escape ' by doubling).
-- Return exactly one SQL block fenced with ```sql ... ```
+
+OUTPUT FORMAT RULES:
+- Always return your final SQL inside a single ```sql ... ``` fenced block.
+- For normal analytical questions: return exactly ONE SELECT query.
+
+- For weekly or multi-metric report style questions (like “generate the weekly report”, “weekly metrics”, “legal team report”):
+    • Output a MULTI-STATEMENT SQL bundle containing several SELECT statements.
+    • Each SELECT must be preceded by a comment line beginning with -- followed by its section title.
+    • All statements and comments must be inside the same ```sql``` fenced block.
+    • Separate statements with semicolons.
+    • Never include text, markdown, or explanations outside the fence.
+    • Use the canonical order and titles defined in the curated schema description (1–11).
+
+Example:
+
+```sql
+-- Contracts Completed with Legal Review (Last 14 Days)
+SELECT ...
+;
+-- New Contracts Assigned to Legal (Last 14 Days)
+SELECT ...
+;
+-- ...
+
 """
     return f"""{rules}
 
@@ -264,12 +288,23 @@ def extract_sql(text:str)->str:
     m = SQL_FENCE_RE.search(text or "")
     return m.group(1).strip().rstrip(";") if m else (text or "").strip().rstrip(";")
 
-def validate_sql_safe(sql:str)->None:
+def validate_sql_safe(sql: str) -> None:
+    """
+    Validate that only safe read-only statements are produced.
+    Allows multiple SELECT statements separated by semicolons.
+    """
     body = sql.strip()
-    if body.endswith(";"): body = body[:-1].strip()
-    if ";" in body: raise ValueError("Disallowed: multiple statements.")
-    if PROHIBITED.search(body): raise ValueError("Only SELECT allowed.")
-    if not body.lower().startswith("select"): raise ValueError("Must start with SELECT.")
+    # remove trailing semicolon
+    if body.endswith(";"):
+        body = body[:-1].strip()
+    # still forbid any non-SELECT verbs
+    if PROHIBITED.search(body):
+        raise ValueError("Only SELECT statements are allowed.")
+    # ensure first statement starts with SELECT
+    if not re.search(r"\bselect\b", body, re.IGNORECASE):
+        raise ValueError("Must contain at least one SELECT statement.")
+
+
 
 def ask_for_sql(q:str)->str:
     sys = build_sql_system_prompt()
@@ -282,17 +317,95 @@ def ask_for_sql(q:str)->str:
 # -----------------------------
 # Summarizer
 # -----------------------------
-def build_summarizer_prompt()->str:
+def build_summarizer_prompt() -> str:
+    """
+    Summarizer explicitly guided by the schema_reference weekly-report structure.
+    Produces a fixed-order, human-readable weekly report using only retrieved numeric data.
+    """
     return (
-        "You are a precise legal/contract analyst. "
-        "Given the user's question and either SQL results or retrieved text, "
-        "write a concise, factual answer:\n"
-        "1) Direct Answer (must be based only on the provided data)\n"
-        "2) How it was computed (reference the SQL or text retrieval used)\n"
-        "3) Caveats (only mention limitations explicitly observable in the data or query). "
-        "If results include 'Department not specified', explain that this means imported contracts "
-        "or workflows without a department field stored in Ironclad.\n"
+        "You are a precise but readable legal-analytics summarizer.\n"
+        "You will receive a JSON payload containing one or more SQL sections with fields:\n"
+        "  title, columns, rows_preview, metric, and sql.\n\n"
+        "ABSOLUTE RULES:\n"
+        "• NEVER invent, infer, or guess numbers or SQL.\n"
+        "• Use ONLY data present in the payload.\n"
+        "• Preserve the canonical weekly-report order (sections 1–11).\n\n"
+        "FORMATTING:\n"
+        "• Report header: 'Weekly Legal & Contract Report'.\n"
+        "• For each section (1–11):\n"
+        "     - Write the section title as a heading.\n"
+        "     - For Sections 1–6: summarize in a short English sentence like\n"
+        "           '7 contracts were completed with legal review in the last 14 days.'\n"
+        "       Use plural/singular correctly and avoid showing raw field names.\n"
+        "     - For Sections 7–10: present tabular or bullet outputs just as returned (reviewer or department lists).\n"
+        "     - For Section 11: treat values as monetary; format with a leading $ and thousands commas (e.g. $1,234,567).\n"
+        "     - If a section has no rows, state 'No data returned for this section.'\n"
+        "• Keep grammar clear, consistent tense (past 14 days / past 12 months etc.).\n"
+        "• Never change or infer numeric values; use only values in payload.metrics or row counts.\n"
+        "• If a metric count or row count is available, use it exactly as provided.\n"
+        "• Finish with one concise overall summary saying something like 'This is a summary of the weekly report'"
+        "But do not make anything up. \n"
     )
+
+
+
+def build_general_summarizer_prompt() -> str:
+    """
+    Summarizer for single-query SQL results.
+    Uses true_numeric_result when present to avoid misreading aggregate queries.
+    """
+    return (
+        "You are a precise legal contracts analyst.\n"
+        "You will receive a JSON payload containing SQL results.\n"
+        "Your job is to describe exactly what is in the results — no assumptions.\n\n"
+        "STRICT RULES:\n"
+        "• If the payload includes 'true_numeric_result', that number is the correct count or total — use it verbatim.\n"
+        "• Otherwise, use 'row_count_returned' or 'total_rows' only to describe how many rows are listed.\n"
+        "• Never mix them up: if there is one row with an aggregate number, report that number, not '1'.\n"
+        "• If multiple rows contain repeated or duplicate IDs or titles, count each unique item only once.\n"
+        "• Never estimate, round, or infer quantities.\n"
+        "• If true_numeric_result > 0, say 'There are N workflows/contracts ...' using that number exactly.\n"
+        "• If there are rows but no numeric field, summarize the rows factually.\n"
+        "• If true_numeric_result = 0 or total_rows = 0, say 'No matching results were found.'\n"
+        "• Keep your answer factual and short (1–2 sentences).\n"
+    )
+
+
+def build_contract_summarizer_prompt() -> str:
+    """
+    Dedicated summarizer for 'Summarize IC-####' questions.
+    Prevents the weekly report format from appearing for contract summaries.
+    """
+    return (
+        "You are a legal contract summarizer.\n"
+        "You will receive text chunks from a single contract in JSON format.\n"
+        "Write a concise summary titled 'Summary for <readable_id>'.\n"
+        "Include key sections such as parties, term, termination, obligations, "
+        "confidentiality, payment, governing law, and other notable terms.\n"
+        "Use bullet points when appropriate.\n"
+        "Do NOT use weekly report or section numbering.\n"
+        "Stick strictly to the provided text; never invent details."
+    )
+
+
+def stream_contract_summary_from_text(payload: Dict[str, Any]):
+    """
+    Streams a contract summary using the dedicated contract summarizer prompt.
+    """
+    stream = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": build_contract_summarizer_prompt()},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        stream=True,
+    )
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+
 
 def stream_summary_from_payload(payload:Dict[str,Any]):
     stream=client.chat.completions.create(
@@ -322,6 +435,10 @@ Rules:
 Examples of true follow-ups:
 Last: "How many workflows are pending Stephanie’s approval?"
 Now: "List them"
+→ {"followup": true}
+
+Last: "How many workflows are pending Stephanie’s approval?"
+Now: "What about Pat?"
 → {"followup": true}
 
 Last: "Show me the NDAs signed in Q2 2024"
@@ -481,13 +598,81 @@ def classify_intent(q:str)->Dict[str,Any]:
 # -----------------------------
 # Answer assembly
 # -----------------------------
-def _answer_with_rows(question,sql,cols,rows,intent):
-    payload={"question":question,"sql":sql,"columns":cols,"rows_preview":safe_json(rows[:50]),"row_count_returned":len(rows),"intent":intent}
-    return {"sql":sql,"columns":cols,"rows":rows,"stream":stream_summary_from_payload(payload),"intent_json":intent}
+def _answer_with_rows(question, sql, cols, rows, intent):
+    """
+    Route output formatting correctly.
+    - Weekly report → use weekly-report summarizer (multi-section layout)
+    - All other single-query results → use general summarizer (short direct answer)
+    """
+    # Detect true numeric value if this is an aggregate COUNT(*) or SUM() result
+    numeric_value = None
+    if len(rows) == 1 and len(cols) == 1:
+        val = rows[0][0]
+        if isinstance(val, (int, float, Decimal)):
+            numeric_value = float(val)
 
-def _answer_with_text(question,meta,texts,intent):
-    payload={"question":question,"meta":meta,"text_blobs":texts,"intent":intent}
-    return {"sql":meta.get("sql",""),"columns":[],"rows":[],"stream":stream_summary_from_payload(payload),"intent_json":intent}
+    payload = {
+        "question": question,
+        "sql": sql,
+        "columns": cols,
+        "rows_preview": safe_json(rows[:50]),
+        "row_count_returned": len(rows),
+        "total_rows": len(rows),
+        "true_numeric_result": numeric_value,  # NEW field: the real count if available
+        "intent": intent,
+    }
+
+
+    # ✅ Detect if this is a weekly report SQL bundle (multi-section keywords)
+    weekly_keywords = [
+        "Contracts Completed with Legal Review",
+        "Weekly Legal Team",
+        "Work Completed by Department",
+    ]
+    is_weekly_report = any(k.lower() in sql.lower() for k in weekly_keywords)
+
+    if is_weekly_report:
+        # Weekly-report summarizer (multi-section layout)
+        stream = stream_summary_from_payload(payload)
+    else:
+        # General summarizer (normal single-query output)
+        stream_resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": build_general_summarizer_prompt()},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            stream=True,
+        )
+        stream = (
+            chunk.choices[0].delta.content
+            for chunk in stream_resp
+            if chunk.choices and chunk.choices[0].delta.content
+        )
+
+    return {
+        "sql": sql,
+        "columns": cols,
+        "rows": rows,
+        "stream": stream,
+        "intent_json": intent,
+    }
+
+
+def _answer_with_text(question, meta, texts, intent):
+    """
+    Handles contract summaries (Summarize IC-####) so they don't use the weekly report layout.
+    """
+    payload = {"question": question, "meta": meta, "text_blobs": texts, "intent": intent}
+    return {
+        "sql": meta.get("sql", ""),
+        "columns": [],
+        "rows": [],
+        "stream": stream_contract_summary_from_text(payload),
+        "intent_json": intent,
+    }
+
 
 # -----------------------------
 # Deterministic helpers
@@ -546,7 +731,61 @@ def _count_unquoted_percent_s(sql: str) -> int:
         i += 1
     return count
 
-def answer_question(question:str, last_question: Optional[str] = None)->Dict[str,Any]:
+def _extract_sections(sql_block: str):
+    """
+    Split a multi-statement SQL block into sections with optional titles.
+    A title is taken from the nearest preceding '-- ...' comment directly
+    above the SELECT. Returns list of dicts: {"title": str|None, "sql": str}
+    """
+    parts = [p for p in sql_block.split(";") if p.strip()]
+    sections = []
+    src = sql_block.splitlines()
+    # Build quick lookup from statement text to title by scanning lines
+    i = 0
+    buf = []
+    current_title = None
+    for line in src:
+        if line.strip().startswith("--"):
+            current_title = line.strip().lstrip("-").strip()
+        buf.append(line)
+        if ";" in line:
+            stmt = "\n".join(buf).strip()
+            # pull only the last SELECT ... before the semicolon
+            # but keep leading comments
+            sections.append({"title": current_title, "sql": stmt.rstrip(";").strip()})
+            buf = []
+            current_title = None
+    # fallback when the last statement has no trailing semicolon
+    leftover = "\n".join(buf).strip()
+    if leftover:
+        sections.append({"title": current_title, "sql": leftover})
+    # final cleanup: only keep statements that contain 'select'
+    out = []
+    for s in sections:
+        if re.search(r"\bselect\b", s["sql"], re.IGNORECASE):
+            out.append({"title": s["title"], "sql": s["sql"]})
+    return out
+
+
+def _derive_metric(cols, rows):
+    """
+    If the result looks like a single-row aggregate, return (name, value).
+    Otherwise return (None, None).
+    """
+    if not cols or not rows:
+        return (None, None)
+    if len(rows) == 1:
+        row = rows[0]
+        # prefer first numeric-looking column
+        for ci, cv in enumerate(row):
+            if isinstance(cv, (int, float, Decimal)) or (
+                isinstance(cv, str) and re.fullmatch(r"-?\d+(\.\d+)?", cv or "")
+            ):
+                return (cols[ci], cv)
+    return (None, None)
+
+
+def answer_question(question: str, last_question: Optional[str] = None) -> Dict[str, Any]:
     # NEW: follow-up preprocessing (safe no-op if last_question is None)
     if last_question:
         try:
@@ -556,70 +795,99 @@ def answer_question(question:str, last_question: Optional[str] = None)->Dict[str
             # Fail-safe: if detection/merge errors, continue with original question
             pass
 
-    intent=classify_intent(question)
+    intent = classify_intent(question)
 
     # Summarize (RAG)
-    if intent["intent"]=="summarize_contract" and intent.get("readable_ids"):
-        rid=intent["readable_ids"][0]
-        cols,rows=run_sql("SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",(rid,),max_rows=5000)
-        texts=[r[1] for r in rows]; acc=0; out=[]
+    if intent["intent"] == "summarize_contract" and intent.get("readable_ids"):
+        rid = intent["readable_ids"][0]
+        cols, rows = run_sql(
+            "SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",
+            (rid,),
+            max_rows=5000,
+        )
+        texts = [r[1] for r in rows]
+        acc = 0
+        out = []
         for t in texts:
-            if acc+len(t)>180_000: break
-            out.append(t); acc+=len(t)
-        return _answer_with_text(question,{"retrieval":"ordered_chunks","readable_id":rid},out,intent)
+            if acc + len(t) > 180_000:
+                break
+            out.append(t)
+            acc += len(t)
+        return _answer_with_text(
+            question, {"retrieval": "ordered_chunks", "readable_id": rid}, out, intent
+        )
 
     # Compare
-    if intent["intent"]=="compare_contracts" and len(intent.get("readable_ids",[]))>=2:
-        a,b=intent["readable_ids"][:2]
+    if intent["intent"] == "compare_contracts" and len(intent.get("readable_ids", [])) >= 2:
+        a, b = intent["readable_ids"][:2]
+
         def grab(rid):
-            c,r=run_sql("SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",(rid,),max_rows=5000)
-            texts=[x[1] for x in r]; acc=0; out=[]
+            c, r = run_sql(
+                "SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",
+                (rid,),
+                max_rows=5000,
+            )
+            texts = [x[1] for x in r]
+            acc = 0
+            out = []
             for t in texts:
-                if acc+len(t)>120_000: break
-                out.append(t); acc+=len(t)
+                if acc + len(t) > 120_000:
+                    break
+                out.append(t)
+                acc += len(t)
             return out
-        return _answer_with_text(question,{"retrieval":"compare","ids":[a,b]},["\n".join(grab(a)),"\n".join(grab(b))],intent)
+
+        return _answer_with_text(
+            question,
+            {"retrieval": "compare", "ids": [a, b]},
+            ["\n".join(grab(a)), "\n".join(grab(b))],
+            intent,
+        )
 
     # Text mention count
-    if intent["intent"]=="text_mention_count":
-        op=intent.get("logic",{}).get("operator","AND").upper()
-        if op not in ("AND","OR"): op="AND"
-        inc=intent.get("terms",[]); exc=intent.get("logic",{}).get("exclude",[])
-        inc_where,inc_params=_ilike_clause_frag("c",inc,op)
-        not_where,not_params=_not_frag("c",exc)
-        sql=f"""WITH matches AS (
+    if intent["intent"] == "text_mention_count":
+        op = intent.get("logic", {}).get("operator", "AND").upper()
+        if op not in ("AND", "OR"):
+            op = "AND"
+        inc = intent.get("terms", [])
+        exc = intent.get("logic", {}).get("exclude", [])
+        inc_where, inc_params = _ilike_clause_frag("c", inc, op)
+        not_where, not_params = _not_frag("c", exc)
+        sql = f"""WITH matches AS (
   SELECT DISTINCT c.readable_id FROM ic.contract_chunks c
   WHERE {inc_where}{not_where}
 ) SELECT COUNT(*) AS contracts_with_term,
          ARRAY(SELECT readable_id FROM matches ORDER BY readable_id LIMIT 5) AS example_ids
 FROM matches"""
-        cols,rows=run_sql(sql,tuple(inc_params+not_params))
-        return _answer_with_rows(question,sql,cols,rows,intent)
+        cols, rows = run_sql(sql, tuple(inc_params + not_params))
+        return _answer_with_rows(question, sql, cols, rows, intent)
 
     # Snippets
-    if intent["intent"]=="text_snippets":
-        terms=intent.get("terms",[])[:2]; near=intent.get("near",{}); limit=10
-        if len(terms)>=2 and near.get("enabled",False):
-            t1,t2=terms[0],terms[1]; win=int(near.get("window",120))
-            pattern=f"(?is)({re.escape(t1)}.{{0,{win}}}{re.escape(t2)}|{re.escape(t2)}.{{0,{win}}}{re.escape(t1)})"
-            sql="""SELECT readable_id,chunk_id,LEFT(chunk_text,300) AS snippet
+    if intent["intent"] == "text_snippets":
+        terms = intent.get("terms", [])[:2]
+        near = intent.get("near", {})
+        limit = 10
+        if len(terms) >= 2 and near.get("enabled", False):
+            t1, t2 = terms[0], terms[1]
+            win = int(near.get("window", 120))
+            pattern = f"(?is)({re.escape(t1)}.{{0,{win}}}{re.escape(t2)}|{re.escape(t2)}.{{0,{win}}}{re.escape(t1)})"
+            sql = """SELECT readable_id,chunk_id,LEFT(chunk_text,300) AS snippet
 FROM ic.contract_chunks WHERE chunk_text ~ %s LIMIT %s"""
-            cols,rows=run_sql(sql,(pattern,limit))
-            return _answer_with_rows(question,sql,cols,rows,intent)
+            cols, rows = run_sql(sql, (pattern, limit))
+            return _answer_with_rows(question, sql, cols, rows, intent)
         else:
-            term=terms[0] if terms else "termination"
-            sql="""SELECT readable_id,chunk_id,LEFT(chunk_text,300) AS snippet
+            term = terms[0] if terms else "termination"
+            sql = """SELECT readable_id,chunk_id,LEFT(chunk_text,300) AS snippet
 FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id,chunk_id LIMIT %s"""
-            cols,rows=run_sql(sql,(term,limit))
-            return _answer_with_rows(question,sql,cols,rows,intent)
+            cols, rows = run_sql(sql, (term, limit))
+            return _answer_with_rows(question, sql, cols, rows, intent)
 
     # ✅ Generic → GPT builds SQL (covers vendor/counterparty, clauses, and all other metadata analytics)
     try:
-        sql=ask_for_sql(question)
+        sql = ask_for_sql(question)
         validate_sql_safe(sql)
 
         # Safety net: if the model still used %s placeholders, auto-bind a single repeated parameter (e.g., vendor_term).
-        # Safety net: bind parameters ONLY if there are unquoted %s placeholders
         params: Optional[Tuple[Any, ...]] = None
         unquoted_count = _count_unquoted_percent_s(sql)
         if unquoted_count > 0:
@@ -631,33 +899,143 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
                     "but no parameters were provided to bind."
                 )
 
-        cols,rows=run_sql(sql, params)
-        return _answer_with_rows(question,sql,cols,rows,intent)
+        # ✅ Handle multi-statement SQL (e.g., weekly report bundles)
+        sections = _extract_sections(sql)
+
+        # --- Weekly report path (multi-section bundle) ---
+        if len(sections) > 1:
+            structured = []
+            for sec in sections:
+                try:
+                    cols, rows = run_sql(sec["sql"])
+                    metric_name, metric_value = _derive_metric(cols, rows)
+
+                    # Optional formatting for money-like metrics
+                    if metric_name and "value" in metric_name.lower() and isinstance(
+                        metric_value, (int, float, Decimal)
+                    ):
+                        metric_value = f"${metric_value:,.0f}"
+
+                    structured.append(
+                        {
+                            "title": sec["title"],
+                            "sql": sec["sql"],
+                            "columns": cols,
+                            "rows_preview": safe_json(rows[:50]),
+                            "row_count_returned": len(rows),
+                            "metric": {
+                                "name": metric_name,
+                                "value": safe_json(metric_value),
+                            }
+                            if metric_name
+                            else None,
+                        }
+                    )
+                except Exception as inner_err:
+                    structured.append(
+                        {"title": sec["title"], "sql": sec["sql"], "error": str(inner_err)}
+                    )
+
+            # Enforce canonical section order for summarizer consistency
+            canonical_order = [
+                "Contracts Completed with Legal Review (Last 14 Days)",
+                "New Contracts Assigned to Legal (Last 14 Days)",
+                "Total Contracts Going Through Ironclad (Last 14 Days)",
+                "Active Contracts Created Over 90 Days Ago",
+                "Contracts with No Activity Over 90 Days",
+                "Active NDAs Created in Last 14 Days",
+                "Weekly Legal Team – Contracts Completed by Reviewer (Last 14 Days)",
+                "Weekly Legal Team – New Contracts Assigned by Reviewer (Last 14 Days)",
+                "Work in Progress by Department",
+                "Work Completed by Department (Past 12 Months)",
+                "Work Completed by Sum of Contract Value (Past 12 Months)",
+            ]
+            structured.sort(
+                key=lambda x: canonical_order.index(x["title"])
+                if x["title"] in canonical_order
+                else 999
+            )
+
+            payload = {
+                "question": question,
+                "report_type": "weekly",
+                "sections": structured,
+                "intent": intent,
+                "sql": sql,
+            }
+
+            # ✅ Weekly report summarizer
+            return {
+                "sql": sql,
+                "columns": [],
+                "rows": [],
+                "stream": stream_summary_from_payload(payload),
+                "intent_json": intent,
+            }
+
+        # --- Normal single-query path ---
+        else:
+            single_sql = sections[0]["sql"] if sections else sql
+            cols, rows = run_sql(single_sql, params)
+            payload = {
+                "question": question,
+                "sql": single_sql,
+                "columns": cols,
+                "rows_preview": safe_json(rows[:50]),
+                "intent": intent,
+            }
+
+            # ✅ Use the general summarizer for single SQL queries
+            stream = client.chat.completions.create(
+                model="gpt-4o-mini",
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": build_general_summarizer_prompt()},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                stream=True,
+            )
+
+            return {
+                "sql": single_sql,
+                "columns": cols,
+                "rows": rows,
+                "stream": (
+                    chunk.choices[0].delta.content
+                    for chunk in stream
+                    if chunk.choices and chunk.choices[0].delta.content
+                ),
+                "intent_json": intent,
+            }
 
     except Exception as e:
         # Summarize error message for human-readable output
-        payload={
-            "question":question,
-            "sql":sql if 'sql' in locals() else "",
-            "error":str(e),
-            "intent":intent
+        payload = {
+            "question": question,
+            "sql": sql if "sql" in locals() else "",
+            "error": str(e),
+            "intent": intent,
         }
         return {
-            "sql":sql if 'sql' in locals() else "",
-            "columns":[],
-            "rows":[],
-            "stream":stream_summary_from_payload(payload),
-            "intent_json":intent
+            "sql": sql if "sql" in locals() else "",
+            "columns": [],
+            "rows": [],
+            # ⬇️ switched to general summarizer (fix)
+            "stream": stream_general_from_payload(payload),
+            "intent_json": intent,
         }
 
     return {
-            "sql": "",
-            "columns": [],
-            "rows": [],
-            "stream": stream_summary_from_payload({
+        "sql": "",
+        "columns": [],
+        "rows": [],
+        # ⬇️ switched to general summarizer (fix)
+        "stream": stream_general_from_payload(
+            {
                 "question": question,
                 "error": "Unhandled query path reached with no output",
-                "intent": intent
-            }),
-            "intent_json": intent
-        }
+                "intent": intent,
+            }
+        ),
+        "intent_json": intent,
+    }
