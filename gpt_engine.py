@@ -52,226 +52,57 @@ def vector_literal(vec:List[float])->str:
 # -----------------------------
 # SQL generation & validation
 # -----------------------------
-def build_sql_system_prompt()->str:
+def build_sql_system_prompt(weekly_allowed: bool) -> str:
     live = get_live_schema()
     live_json = json.dumps(live, indent=2, sort_keys=True)
-    rules = """
+
+    weekly_switch = (
+        "WEEKLY_ALLOWED=TRUE\n"
+        "You MAY output a MULTI-STATEMENT SQL bundle (sections 1–11) only when the user asked for a weekly report.\n"
+    ) if weekly_allowed else (
+        "WEEKLY_ALLOWED=FALSE\n"
+        "STRICT RULE: Output exactly ONE SELECT statement. Do NOT emit multi-statement bundles or weekly section headers.\n"
+    )
+
+    rules = f"""
 You are a legal contracts analytics assistant. You must output ONLY PostgreSQL SQL inside a single ```sql ... ``` code fence.
 No prose, no markdown headings, no explanations outside the fence.
 
-HARD RULES:
-CONTRACTS / AGREEMENTS / WORKFLOWS:
-- The terms "contract(s)", "agreement(s)", and "workflow(s)" all mean the same thing in this system.
-- Always query from ic.workflows (joined with related tables if needed).
-- Do not treat "contracts" as a separate table — they are all stored in ic.workflows.
-- For counts like "how many contracts", "how many agreements", or "how many workflows", always count rows from ic.workflows.
-- For listing, return workflow-level information (w.readable_id, w.title, w.status, department, etc.).
+{weekly_switch}
 
+HARD RULES (controller-level):
+- SELECT-only. Never emit CREATE/INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/GRANT/REVOKE/MERGE/VACUUM/COPY/SET/SHOW.
+- The terms "contract(s)", "agreement(s)", and "workflow(s)" all refer to records in ic.workflows.
+- For counts like "how many contracts/agreements/workflows", count rows from ic.workflows.
+- For listing, return workflow-level fields (w.readable_id, w.title, etc.) and LIMIT 100 unless user asks otherwise.
+- Do not invent column names. Use only columns that exist in the live schema below.
 
-- SELECT-only. Never emit CREATE/INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/GRANT/REVOKE/MERGE/VACUUM/COPY/SET/SHOW. Users questions will never be about any of create/insert/update/delete/drop/alter/truncate/grant/revoke/merge/vacuum/copy/set/show, always interpret them as SQL queries.
-- Treat natural words "create/review/sign/archive" as workflow steps.
-- Status values: 'completed' (finished) and 'active' (in-progress).
-- Use only existing columns. Do not invent names.
-
-CLAUSES VS TEXT SEARCH:
-- If the user explicitly says "clause"/"clauses", query ic.clauses (workflows joined via workflow_id). Count DISTINCT workflow_id for counts.
-- If the user does NOT say "clause", treat it as a text search/mention task (outside SQL path).
-
-VENDOR/COUNTERPARTY:
-- Prefer ic.workflows.counterparty_name when filtering by vendor/counterparty.
-- If NULL, fallback to COALESCE(legal_entity,'') ILIKE or title ILIKE.
-
-- Imported contracts: always filter with "attributes ? 'importId'".
-  Do NOT guess based on title or record_type.
-  For time-based questions (e.g. "imports by month"), always use
-    (attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
-  instead of created_at or agreementDate/standard_executedDate.
-  When filtering imported contracts by a given month, never use HAVING with the alias.
-  Instead, repeat the DATE_TRUNC(...) expression directly inside the WHERE clause.
-
-
-QUARTER WINDOWS:
-- Always determine quarter ranges using CURRENT_DATE and calendar quarters.
-- "Last quarter" = the previous full calendar quarter:
-    execution_date >= date_trunc('quarter', CURRENT_DATE) - INTERVAL '3 months'
-    AND execution_date <  date_trunc('quarter', CURRENT_DATE)
-- "This quarter" = the current full calendar quarter:
-    execution_date >= date_trunc('quarter', CURRENT_DATE)
-    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
-- "Next quarter" = the next full calendar quarter:
-    execution_date >= date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
-    AND execution_date <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '6 months'
-- For explicit quarters like "Q1 2024" or "Q3 2023":
-    Use EXTRACT(YEAR FROM execution_date)=YYYY
-    AND EXTRACT(QUARTER FROM execution_date)=N
-    (Q1=1, Q2=2, Q3=3, Q4=4).
-- Never approximate with “last 3 months.” Always anchor to CURRENT_DATE and use calendar quarter boundaries.
-- Never use INTERVAL '1 quarter' (invalid). Use INTERVAL '3 months' instead.
-- The current year is 2025. 
-
-APPROVALS:
-- Use ic.approval_requests (alias a). Each row = one approval request/decision.
-- Join with ic.role_assignees (ra) ON (workflow_id, role_id) to resolve user_name/email.
-- Join with ic.workflows (w) for workflow status.
-- Person matching MUST be broad and case-insensitive:
-    • (LOWER(ra.user_name) ILIKE '%'||LOWER('<term>')||'%' OR LOWER(ra.email) ILIKE '%'||LOWER('<term>')||'%')
-
-STATUS HANDLING:
-- Approved approvals:
-    • LOWER(a.status)='approved'
-    • Always filter with a.end_time (the decision time).
-- Pending approvals:
-    • LOWER(a.status)='pending' AND a.end_time IS NULL
-    • Always require w.status='active' (pending approvals only exist on in-progress workflows).
-- Approver reassigned:
-    • LOWER(a.status) LIKE 'approver reassigned%'.
-
-TIME WINDOWS (always anchor to CURRENT_DATE):
-- Month:
-    a.end_time >= date_trunc('month', CURRENT_DATE)
-    AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
-- Last 3 months (rolling):
-    a.end_time >= CURRENT_DATE - INTERVAL '3 months'
-    AND a.end_time <  CURRENT_DATE
-- Last 6 months (rolling):
-    a.end_time >= CURRENT_DATE - INTERVAL '6 months'
-    AND a.end_time <  CURRENT_DATE
-- Quarter (calendar aligned):
-    a.end_time >= date_trunc('quarter', CURRENT_DATE)
-    AND a.end_time <  date_trunc('quarter', CURRENT_DATE) + INTERVAL '3 months'
-- Year (calendar aligned):
-    a.end_time >= date_trunc('year', CURRENT_DATE)
-    AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
-- Week:
-    a.end_time >= CURRENT_DATE - INTERVAL '7 days'
-    AND a.end_time < CURRENT_DATE
-- If no timeframe is given → do not filter on dates.
-
-WORKFLOW SCOPE:
-- If user says “in progress” → add w.status='active'.
-- If user says “completed” → add w.status='completed'.
-- If the user says “pending approval” → require w.status='active'.
-- If no state specified → include all.
-
-OUTPUT SHAPE (ABSOLUTE RULES):
-- Return **exactly one** SQL statement.
+OUTPUT SHAPE:
+- When WEEKLY_ALLOWED=FALSE:
+  • Return exactly ONE SELECT statement (no CTE bundle of sections).
 - If the user asks “how many / count”, return a single scalar COUNT in one SELECT.
-- If the user asks “list / show / which”, return a single SELECT of rows (no COUNT, no extra statements).
-  Prefer columns:
-    w.workflow_id, w.readable_id, w.title
-  Optionally include: a.role_name, a.start_time, a.end_time
-  Order by a.end_time DESC (for approved) or a.start_time DESC (for pending), and LIMIT 100.
+- If the user asks “list / show / which”, return a single SELECT of rows (no extra counts).
+- Wrap the final SQL in a single ```sql``` fenced block.
 
-EXAMPLES:
-
--- Count: approved by Adam (all time)
-SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
-FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
-  AND (LOWER(ra.user_name) ILIKE '%adam%' OR LOWER(ra.email) ILIKE '%adam%');
-
--- List: approved by Adam in the last 3 months (rows, not count)
-SELECT w.workflow_id, w.readable_id, w.title, a.role_name, a.end_time
-FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
-  AND (LOWER(ra.user_name) ILIKE '%adam%' OR LOWER(ra.email) ILIKE '%adam%')
-  AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
-  AND a.end_time <  CURRENT_DATE
-ORDER BY a.end_time DESC
-LIMIT 100;
-
--- Count: pending approvals for Stephanie (active workflows only)
-SELECT COUNT(DISTINCT a.workflow_id) AS pending_workflows
-FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='pending'
-  AND a.end_time IS NULL
-  AND w.status='active'
-  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
-
--- List: pending approvals for Stephanie (rows, not count)
-SELECT w.workflow_id, w.readable_id, w.title, a.role_name, a.start_time
-FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='pending'
-  AND a.end_time IS NULL
-  AND w.status='active'
-  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%')
-ORDER BY a.start_time DESC
-LIMIT 100;
-
-
-DEPARTMENT LOGIC:
-- Department values may be messy, especially for imported workflows (OCR errors, typos, personal names).
-- Always normalize departments using both ic.department_map and ic.department_canonical.
-- If the department cannot be resolved, label it as 'Department not specified'.
-- 'Department not specified' = imported contracts or workflows that do not have a department field stored in Ironclad.
-- Never use raw ILIKE matching on department names. Always resolve through canonical mapping.
-
-- SQL pattern when grouping or filtering by department:
-
-    SELECT
-      COALESCE(
-        dm.canonical_value,
-        c1.canonical_value,
-        c2.canonical_value,
-        'Department not specified'
-      ) AS department_clean,
-      COUNT(*) ...
-    FROM ic.workflows w
-    LEFT JOIN ic.department_map dm
-      ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
-    LEFT JOIN ic.department_canonical c1
-      ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
-    LEFT JOIN ic.department_canonical c2
-      ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
-    WHERE w.created_at >= date_trunc('month', CURRENT_DATE)
-      AND w.created_at < date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
-      AND COALESCE(
-        dm.canonical_value,
-        c1.canonical_value,
-        c2.canonical_value,
-        'Department not specified'
-      ) = 'IT'
-
-- Always GROUP BY department_clean, never by raw department.
-- Never hardcode department names; rely only on mapping + canonical list.
-
-
-
-CONSTANTS:
-- Do NOT use parameter placeholders like %s. Inline constants as proper SQL string literals (escape ' by doubling).
-
-OUTPUT FORMAT RULES:
-- Always return your final SQL inside a single ```sql ... ``` fenced block.
-- For normal analytical questions: return exactly ONE SELECT query.
-
-- For weekly or multi-metric report style questions (like “generate the weekly report”, “weekly metrics”, “legal team report”):
-    • Output a MULTI-STATEMENT SQL bundle containing several SELECT statements.
-    • Each SELECT must be preceded by a comment line beginning with -- followed by its section title.
-    • All statements and comments must be inside the same ```sql``` fenced block.
-    • Separate statements with semicolons.
-    • Never include text, markdown, or explanations outside the fence.
-    • Use the canonical order and titles defined in the curated schema description (1–11).
+# Weekly report bundle (ONLY when WEEKLY_ALLOWED=TRUE):
+# • Output a MULTI-STATEMENT SQL bundle (sections 1–11).
+# • Each SELECT must be preceded by a comment line beginning with -- followed by its section title.
+# • All statements and comments must be inside the same ```sql``` fenced block.
+# • Separate statements with semicolons.
+# • Use the canonical order and titles defined in the curated schema description (1–11).
 
 Example:
 
 ```sql
 -- Contracts Completed with Legal Review (Last 14 Days)
-SELECT ...
+SELECT ... 
 ;
 -- New Contracts Assigned to Legal (Last 14 Days)
-SELECT ...
+SELECT ... 
 ;
 -- ...
-
 """
+
     return f"""{rules}
 
 === Curated Schema Description ===
@@ -280,6 +111,7 @@ SELECT ...
 === Live Schema ===
 {live_json}
 """
+
 
 SQL_FENCE_RE = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE|re.DOTALL)
 PROHIBITED = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|MERGE|VACUUM|COPY|\\copy|SET\s+|SHOW\s+)\b", re.IGNORECASE)
@@ -304,13 +136,11 @@ def validate_sql_safe(sql: str) -> None:
     if not re.search(r"\bselect\b", body, re.IGNORECASE):
         raise ValueError("Must contain at least one SELECT statement.")
 
-
-
-def ask_for_sql(q:str)->str:
-    sys = build_sql_system_prompt()
+def ask_for_sql(q: str, weekly_allowed: bool) -> str:
+    sys = build_sql_system_prompt(weekly_allowed)
     resp = client.chat.completions.create(
-        model="gpt-4o-mini",temperature=0,
-        messages=[{"role":"system","content":sys},{"role":"user","content":q}]
+        model="gpt-4o-mini", temperature=0,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": q}]
     )
     return extract_sql(resp.choices[0].message.content or "")
 
@@ -347,8 +177,6 @@ def build_summarizer_prompt() -> str:
         "But do not make anything up. \n"
     )
 
-
-
 def build_general_summarizer_prompt() -> str:
     """
     Summarizer for single-query SQL results.
@@ -371,8 +199,6 @@ def build_general_summarizer_prompt() -> str:
         "• Keep your answer factual but readable — 1–3 sentences max.\n"
     )
 
-
-
 def build_contract_summarizer_prompt() -> str:
     """
     Dedicated summarizer for 'Summarize IC-####' questions.
@@ -388,7 +214,6 @@ def build_contract_summarizer_prompt() -> str:
         "Do NOT use weekly report or section numbering.\n"
         "Stick strictly to the provided text; never invent details."
     )
-
 
 def stream_contract_summary_from_text(payload: Dict[str, Any]):
     """
@@ -407,8 +232,6 @@ def stream_contract_summary_from_text(payload: Dict[str, Any]):
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
             yield chunk.choices[0].delta.content
 
-
-
 def stream_summary_from_payload(payload:Dict[str,Any]):
     stream=client.chat.completions.create(
         model="gpt-4o-mini",temperature=0,
@@ -416,6 +239,22 @@ def stream_summary_from_payload(payload:Dict[str,Any]):
             {"role":"system","content":build_summarizer_prompt()},
             {"role":"user","content":json.dumps(payload,ensure_ascii=False)},
         ],stream=True
+    )
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content
+
+def stream_general_from_payload(payload: Dict[str, Any]):
+    """
+    Streams a short factual summary for single-query SQL results or error messages.
+    """
+    stream = client.chat.completions.create(
+        model="gpt-4o-mini", temperature=0,
+        messages=[
+            {"role": "system", "content": build_general_summarizer_prompt()},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        stream=True,
     )
     for chunk in stream:
         if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
@@ -465,7 +304,6 @@ Now: "Which contracts mention liability?"
 → {"followup": false}
 """
 
-
 FOLLOWUP_MERGE_PROMPT = """
 You are a question rewriter. Given the previous user question (Last) and the current follow-up (Now),
 rewrite them into ONE clear standalone question that does not rely on prior context.
@@ -480,7 +318,6 @@ CRITICAL:
 - Do NOT invent new information.
 - Output ONLY the rewritten question as plain text (no explanations).
 """
-
 
 def is_followup(last_q: str, current_q: str) -> bool:
     if not last_q or not current_q: 
@@ -515,7 +352,7 @@ INTENT_SYSTEM_PROMPT = """
 You are an intent classifier for a legal contracts bot.
 Output STRICT JSON only with schema:
 {
-  "intent": "text_mention_count | text_snippets | summarize_contract | compare_contracts | semantic_find | similar_to_contract | sql_generic",
+  "intent": "text_mention_count | text_snippets | summarize_contract | compare_contracts | semantic_find | similar_to_contract | weekly_report | sql_generic",
   "terms": [string],
   "logic": {"operator":"AND|OR","exclude":[string]},
   "near": {"enabled":true|false,"window":120},
@@ -526,6 +363,10 @@ Output STRICT JSON only with schema:
 }
 
 Routing guidance:
+- If the user requests a weekly/this-week legal activity summary, classify as weekly_report.
+  Examples of paraphrases to treat as weekly_report (handle typos and variants): 
+  "weekly report", "weekly metrics", "legal team report", "this week's report", 
+  "this week’s report", "generate the weekly report", "make the weekly report".
 - summarize IC-#### → summarize_contract
 - compare IC-#### vs IC-#### → compare_contracts
 - "how many mention …" / "show snippets …" (when user does NOT say 'clause') → text_mention_count or text_snippets
@@ -535,6 +376,12 @@ Routing guidance:
 - else → sql_generic
 
 Examples:
+User: generate the weekly report
+{"intent":"weekly_report"}
+
+User: this week's legal team report
+{"intent":"weekly_report"}
+
 User: summarize IC-1001
 {"intent":"summarize_contract","readable_ids":["IC-1001"],"terms":[],"logic":{"operator":"AND","exclude":[]}}
 
@@ -602,11 +449,9 @@ def classify_intent(q:str)->Dict[str,Any]:
 # -----------------------------
 def _answer_with_rows(question, sql, cols, rows, intent):
     """
-    Route output formatting correctly.
-    - Weekly report → use weekly-report summarizer (multi-section layout)
-    - All other single-query results → use general summarizer (short direct answer)
+    Formats single-query (non-weekly) answers with the general summarizer.
+    Weekly routing is handled in answer_question based on intent.
     """
-    # Detect true numeric value if this is an aggregate COUNT(*) or SUM() result
     numeric_value = None
     if len(rows) == 1 and len(cols) == 1:
         val = rows[0][0]
@@ -620,38 +465,24 @@ def _answer_with_rows(question, sql, cols, rows, intent):
         "rows_preview": safe_json(rows[:50]),
         "row_count_returned": len(rows),
         "total_rows": len(rows),
-        "true_numeric_result": numeric_value,  # NEW field: the real count if available
+        "true_numeric_result": numeric_value,
         "intent": intent,
     }
 
-
-    # ✅ Detect if this is a weekly report SQL bundle (multi-section keywords)
-    weekly_keywords = [
-        "Contracts Completed with Legal Review",
-        "Weekly Legal Team",
-        "Work Completed by Department",
-    ]
-    is_weekly_report = any(k.lower() in sql.lower() for k in weekly_keywords)
-
-    if is_weekly_report:
-        # Weekly-report summarizer (multi-section layout)
-        stream = stream_summary_from_payload(payload)
-    else:
-        # General summarizer (normal single-query output)
-        stream_resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {"role": "system", "content": build_general_summarizer_prompt()},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            stream=True,
-        )
-        stream = (
-            chunk.choices[0].delta.content
-            for chunk in stream_resp
-            if chunk.choices and chunk.choices[0].delta.content
-        )
+    stream_resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": build_general_summarizer_prompt()},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        stream=True,
+    )
+    stream = (
+        chunk.choices[0].delta.content
+        for chunk in stream_resp
+        if chunk.choices and chunk.choices[0].delta.content
+    )
 
     return {
         "sql": sql,
@@ -660,7 +491,6 @@ def _answer_with_rows(question, sql, cols, rows, intent):
         "stream": stream,
         "intent_json": intent,
     }
-
 
 def _answer_with_text(question, meta, texts, intent):
     """
@@ -674,7 +504,6 @@ def _answer_with_text(question, meta, texts, intent):
         "stream": stream_contract_summary_from_text(payload),
         "intent_json": intent,
     }
-
 
 # -----------------------------
 # Deterministic helpers
@@ -699,8 +528,6 @@ def _not_frag(alias,terms):
 # -----------------------------
 # Main router
 # -----------------------------
-
-
 def _count_unquoted_percent_s(sql: str) -> int:
     """
     Counts %s placeholders that are OUTSIDE single-quoted string literals.
@@ -743,7 +570,6 @@ def _extract_sections(sql_block: str):
     sections = []
     src = sql_block.splitlines()
     # Build quick lookup from statement text to title by scanning lines
-    i = 0
     buf = []
     current_title = None
     for line in src:
@@ -752,8 +578,6 @@ def _extract_sections(sql_block: str):
         buf.append(line)
         if ";" in line:
             stmt = "\n".join(buf).strip()
-            # pull only the last SELECT ... before the semicolon
-            # but keep leading comments
             sections.append({"title": current_title, "sql": stmt.rstrip(";").strip()})
             buf = []
             current_title = None
@@ -767,7 +591,6 @@ def _extract_sections(sql_block: str):
         if re.search(r"\bselect\b", s["sql"], re.IGNORECASE):
             out.append({"title": s["title"], "sql": s["sql"]})
     return out
-
 
 def _derive_metric(cols, rows):
     """
@@ -786,7 +609,6 @@ def _derive_metric(cols, rows):
                 return (cols[ci], cv)
     return (None, None)
 
-
 def answer_question(question: str, last_question: Optional[str] = None) -> Dict[str, Any]:
     # NEW: follow-up preprocessing (safe no-op if last_question is None)
     if last_question:
@@ -798,6 +620,7 @@ def answer_question(question: str, last_question: Optional[str] = None) -> Dict[
             pass
 
     intent = classify_intent(question)
+    is_weekly = (intent.get("intent") == "weekly_report")
 
     # Summarize (RAG)
     if intent["intent"] == "summarize_contract" and intent.get("readable_ids"):
@@ -886,7 +709,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
 
     # ✅ Generic → GPT builds SQL (covers vendor/counterparty, clauses, and all other metadata analytics)
     try:
-        sql = ask_for_sql(question)
+        sql = ask_for_sql(question, weekly_allowed=is_weekly)
         validate_sql_safe(sql)
 
         # Safety net: if the model still used %s placeholders, auto-bind a single repeated parameter (e.g., vendor_term).
@@ -901,22 +724,24 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
                     "but no parameters were provided to bind."
                 )
 
-        # ✅ Handle multi-statement SQL (e.g., weekly report bundles)
+        # ✅ Handle multi-statement SQL
         sections = _extract_sections(sql)
 
-        # --- Weekly report path (multi-section bundle) ---
-        if len(sections) > 1:
+        # --- Weekly report path (intent-driven) ---
+        if is_weekly:
             structured = []
-            for sec in sections:
+            # If model returned only one statement, still process it; otherwise iterate all.
+            target_sections = sections if sections else [{"title": None, "sql": sql}]
+            for sec in target_sections:
                 try:
                     cols, rows = run_sql(sec["sql"])
                     metric_name, metric_value = _derive_metric(cols, rows)
 
                     # Optional formatting for money-like metrics
-                    if metric_name and "value" in metric_name.lower() and isinstance(
+                    if metric_name and "value" in (metric_name or "").lower() and isinstance(
                         metric_value, (int, float, Decimal)
                     ):
-                        metric_value = f"${metric_value:,.0f}"
+                        metric_value = f"${float(metric_value):,.0f}"
 
                     structured.append(
                         {
@@ -966,7 +791,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
                 "sql": sql,
             }
 
-            # ✅ Weekly report summarizer
+            # ✅ Weekly-report summarizer
             return {
                 "sql": sql,
                 "columns": [],
@@ -975,40 +800,41 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
                 "intent_json": intent,
             }
 
-        # --- Normal single-query path ---
-        else:
-            single_sql = sections[0]["sql"] if sections else sql
-            cols, rows = run_sql(single_sql, params)
-            payload = {
-                "question": question,
-                "sql": single_sql,
-                "columns": cols,
-                "rows_preview": safe_json(rows[:50]),
-                "intent": intent,
-            }
+        # --- Normal single-query path (force single statement if model misbehaves) ---
+        single_sql = sections[0]["sql"] if sections else sql
+        cols, rows = run_sql(single_sql, params)
+        payload = {
+            "question": question,
+            "sql": single_sql,
+            "columns": cols,
+            "rows_preview": safe_json(rows[:50]),
+            "intent": intent,
+        }
 
-            # ✅ Use the general summarizer for single SQL queries
-            stream = client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=0,
-                messages=[
-                    {"role": "system", "content": build_general_summarizer_prompt()},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                stream=True,
-            )
+        # ✅ Use the general summarizer for single SQL queries
+        stream = client.chat_completions.create(  # backward compat guard (won't be used)
+            # intentionally unused; real stream below
+        ) if False else client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": build_general_summarizer_prompt()},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            stream=True,
+        )
 
-            return {
-                "sql": single_sql,
-                "columns": cols,
-                "rows": rows,
-                "stream": (
-                    chunk.choices[0].delta.content
-                    for chunk in stream
-                    if chunk.choices and chunk.choices[0].delta.content
-                ),
-                "intent_json": intent,
-            }
+        return {
+            "sql": single_sql,
+            "columns": cols,
+            "rows": rows,
+            "stream": (
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if chunk.choices and chunk.choices[0].delta.content
+            ),
+            "intent_json": intent,
+        }
 
     except Exception as e:
         # Summarize error message for human-readable output
@@ -1022,16 +848,15 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "sql": sql if "sql" in locals() else "",
             "columns": [],
             "rows": [],
-            # ⬇️ switched to general summarizer (fix)
             "stream": stream_general_from_payload(payload),
             "intent_json": intent,
         }
 
+    # Fallback (should not reach)
     return {
         "sql": "",
         "columns": [],
         "rows": [],
-        # ⬇️ switched to general summarizer (fix)
         "stream": stream_general_from_payload(
             {
                 "question": question,
