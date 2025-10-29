@@ -14,6 +14,16 @@ if "chat_history" not in st.session_state:
 if "last_sql" not in st.session_state:
     st.session_state.last_sql = ""
 
+# ✅ new persistent conversation state
+if "conversation_summary" not in st.session_state:
+    st.session_state.conversation_summary = None
+if "scope" not in st.session_state:
+    st.session_state.scope = {}
+if "resolved_question" not in st.session_state:
+    st.session_state.resolved_question = None
+if "primary_response" not in st.session_state:
+    st.session_state.primary_response = None
+
 # --- Show chat history ---
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
@@ -30,43 +40,56 @@ if question:
             last_user_question = past["content"]
             break
 
+    # Display user message
     st.session_state.chat_history.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
+    # Display assistant response container
     with st.chat_message("assistant"):
         response_container = st.empty()
         response_text = ""
 
         try:
-            # ✅ Pass last_user_question into gpt_engine
-            result = answer_question(question, last_question=last_user_question)
+            # ✅ Pass full session context into gpt_engine
+            result = answer_question(
+                question=question,
+                last_question=last_user_question,
+                conversation_summary=st.session_state.conversation_summary,
+                scope=st.session_state.scope,
+                resolved_question=st.session_state.resolved_question,
+                primary_response=st.session_state.primary_response,
+            )
 
-            # --- Stream answer directly from result["stream"] ---
+            # --- Stream the model's answer ---
             for token in result["stream"]:
                 response_text += token
                 response_container.markdown(f"**{response_text}▌**")
             response_container.markdown(f"**{response_text}**")
 
-
-
+            # Save chat + SQL
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": response_text}
             )
-            st.session_state.last_sql = result["sql"]
+            st.session_state.last_sql = result.get("sql", "")
 
-            # --- Show SQL + table preview ---
+            # ✅ Persist updated conversation state from engine
+            st.session_state.conversation_summary = result.get("conversation_summary")
+            st.session_state.scope = result.get("scope", st.session_state.scope)
+            st.session_state.resolved_question = result.get("resolved_question")
+            st.session_state.primary_response = result.get("primary_response")
+
             # --- Collapsible Generated SQL ---
-            with st.expander("📄 Generated SQL", expanded=False):
-                st.code(result["sql"], language="sql")
+            if "sql" in result and result["sql"]:
+                with st.expander("📄 Generated SQL", expanded=False):
+                    st.code(result["sql"], language="sql")
 
             # --- Optional table preview ---
-            if result["rows"]:
-                df = pd.DataFrame(result["rows"], columns=result["columns"])
+            if result.get("rows"):
+                df = pd.DataFrame(result["rows"], columns=result.get("columns", []))
                 st.dataframe(df, use_container_width=True)
             else:
                 st.info("No rows returned.")
-
 
         except Exception as e:
             error_msg = f"Error: {e}"
