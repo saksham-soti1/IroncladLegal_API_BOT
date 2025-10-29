@@ -590,7 +590,7 @@ The report covers rolling windows relative to CURRENT_DATE.
     SELECT COUNT(DISTINCT w.workflow_id) AS contracts_completed_with_named_legal_review
     FROM ic.workflows w
     WHERE w.status = 'completed'
-      AND w.execution_date >= CURRENT_DATE - INTERVAL '14 days'
+      AND w.execution_date >= CURRENT_DATE - INTERVAL '13 days'
       AND w.execution_date < CURRENT_DATE
       AND EXISTS (
         SELECT 1
@@ -618,7 +618,7 @@ The report covers rolling windows relative to CURRENT_DATE.
       ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
     JOIN ic.workflows w
       ON w.workflow_id = a.workflow_id
-    WHERE a.start_time >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE a.start_time >= CURRENT_DATE - INTERVAL '13 days'
       AND a.start_time < CURRENT_DATE
       AND LOWER(w.status) IN ('active','completed')
       AND (
@@ -635,7 +635,7 @@ The report covers rolling windows relative to CURRENT_DATE.
 3. Total Contracts Going Through Ironclad (Last 14 Days)
     SELECT COUNT(*) AS total_contracts_in_ironclad_last_14_days
     FROM ic.workflows
-    WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE created_at >= CURRENT_DATE - INTERVAL '13 days'
       AND created_at < CURRENT_DATE
       AND LOWER(status) IN ('active','completed');
 
@@ -648,13 +648,13 @@ The report covers rolling windows relative to CURRENT_DATE.
 5. Contracts with No Activity Over 90 Days
     SELECT COUNT(*) AS contracts_no_activity_over_90_days
     FROM ic.workflows
-    WHERE last_updated_at < CURRENT_DATE - INTERVAL '90 days'
+    WHERE last_updated_at < CURRENT_DATE - INTERVAL '89 days'
       AND LOWER(status) IN ('active','paused');
 
 6. Active NDAs Created in Last 14 Days
     SELECT COUNT(*) AS active_ndas_last_14_days
     FROM ic.workflows
-    WHERE created_at >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE created_at >= CURRENT_DATE - INTERVAL '13 days'
       AND created_at < CURRENT_DATE
       AND LOWER(status) = 'active'
       AND LOWER(title) LIKE '%nda%';
@@ -666,7 +666,7 @@ The report covers rolling windows relative to CURRENT_DATE.
     JOIN ic.approval_requests a ON a.workflow_id = w.workflow_id
     JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
     WHERE w.status = 'completed'
-      AND w.execution_date >= CURRENT_DATE - INTERVAL '14 days'
+      AND w.execution_date >= CURRENT_DATE - INTERVAL '13 days'
       AND w.execution_date < CURRENT_DATE
       AND LOWER(a.status) = 'approved'
       AND (
@@ -688,7 +688,7 @@ The report covers rolling windows relative to CURRENT_DATE.
     FROM ic.approval_requests a
     JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
     JOIN ic.workflows w ON w.workflow_id = a.workflow_id
-    WHERE a.start_time >= CURRENT_DATE - INTERVAL '14 days'
+    WHERE a.start_time >= CURRENT_DATE - INTERVAL '13 days'
       AND a.start_time < CURRENT_DATE
       AND LOWER(w.status) IN ('active','completed')
       AND (
