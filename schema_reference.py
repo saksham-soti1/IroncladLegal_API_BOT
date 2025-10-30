@@ -12,6 +12,10 @@ Table: workflows
 - status (TEXT)
   ✅ Completed workflows → 'completed'
   ✅ In-progress workflows → 'active'
+  ✅ "Executed", "signed", or "finished" contracts are defined as:
+     status = 'completed' OR attributes ? 'importId'
+     (Imported workflows should be considered executed even if status is not 'completed')
+     Always include both conditions in the WHERE clause when filtering for executed contracts.
   ❌ Do not filter by 'In Progress' (not a stored value)
 
 - step (TEXT)  -- only present for in-progress
@@ -72,8 +76,16 @@ DEPARTMENT LOGIC:
 - Never hardcode department names; rely only on mapping + canonical list.
 
 
+- owner (TEXT): The workflow owner must always be retrieved from ic.role_assignees
+  - Use ra.user_name from ic.role_assignees where role_id = 'owner'
+  - Join using:
 
-- owner_name (TEXT)
+      JOIN ic.role_assignees ra
+        ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
+
+  - Never use w.owner_name — it is unreliable and often null
+  - Always group by or filter using ra.user_name
+
 - paper_source (TEXT)
 - document_type (TEXT)          -- not the contract type category
 - agreement_date (TIMESTAMPTZ)
