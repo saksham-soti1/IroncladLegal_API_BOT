@@ -196,13 +196,23 @@ def build_general_summarizer_prompt() -> str:
 def build_contract_summarizer_prompt() -> str:
     return (
         "You are a legal contract summarizer.\n"
-        "You will receive text chunks from a single contract in JSON format.\n"
-        "Write a concise summary titled 'Summary for <readable_id>'.\n"
-        "Include key sections such as parties, term, termination, obligations, "
-        "confidentiality, payment, governing law, and notable terms.\n"
-        "Use bullet points when appropriate; never invent details.\n"
-        "Do NOT use weekly report formatting.\n"
+        "You will receive a list of ordered text chunks under 'texts' for a single contract.\n"
+        "Write a professional, structured summary titled 'Summary for <readable_id>'.\n"
+        "First are foremost, write a short summary of the contract in a few sentences.\n"
+        "Include key sections ONLY when present:\n"
+        "- Parties (who is involved)\n"
+        "- Term (start + duration)\n"
+        "- Termination (notice, triggers)\n"
+        "- Obligations (what each party must do)\n"
+        "- Confidentiality (what’s covered)\n"
+        "- Payment (amounts, terms)\n"
+        "- Governing Law\n"
+        "- Notable Terms (anything unusual or specific)\n\n"
+        "NEVER invent or guess — only include what’s present.\n"
+        "Skip sections that are not mentioned in the text.\n"
+        "Use bullet points where helpful. Be concise and accurate."
     )
+
 
 def stream_contract_summary_from_text(payload: Dict[str, Any]):
     stream = client.chat.completions.create(
@@ -269,40 +279,65 @@ OUTPUT STRICT JSON:
 """
 
 REWRITER_PROMPT = """
-You rewrite user messages into self-contained questions and decide if they are follow-ups.
+You rewrite user messages into fully self-contained questions and determine whether they are follow-ups to the active topic.
 
 INPUTS:
-- user_text: the new raw user message
-- relevant_history: 2–5 short bullets describing the active topic/scope
-- scope: JSON dict of active filters (timeframe/status/vendor/department/ids/etc.)
-- prior_resolved_question: last fully self-contained question (may be null)
+- user_text: the raw user message
+- relevant_history: a small list of 2–5 bullet points describing the current topic, active filters, or scope
+- scope: a JSON dict of active filters (e.g., timeframe, status, vendor, department, step, record_type, approver, priority, etc.)
+- prior_resolved_question: the last fully self-contained question that was asked
+
+GOAL:
+- Resolve whether this is a follow-up or a new topic.
+- If it is a follow-up, inherit any relevant filters from the current scope, unless explicitly overridden.
+- If it is a new topic, do not inherit anything; reset filters as needed.
 
 RULES:
-- Determine if this is a FOLLOW-UP to the active topic.
-  - Only mark followup=true if the user is clearly continuing or refining a prior query.
-  - Examples: adding filters (vendor, type, date), asking for breakdowns, exclusions, grouping, totals, or follow-up questions like “how many of those…”, “break that down…”, “what about…”
 
-- If the new message asks about a different entity or task (e.g., new timeframe, new status, new subject like "in-progress workflows"), then it's a NEW TOPIC → followup=false.
+-- FOLLOW-UP DETECTION --
 
-- NEVER assume a question is a follow-up just because there is prior context. The message must clearly depend on it.
+- You MUST mark is_followup = true if the user relies on prior scope or context in any of the following ways:
+    • Uses vague or referential language: "those", "that", "how many of those", "what about", "break that down", "split by", "and how many", "same filters"
+    • Asks for a breakdown of something just counted: e.g., "by department", "by type", "by vendor", "split by priority"
+    • Adds additional filters to the prior scope: e.g., "and how many were MSAs", "only the ones with high priority", "from Clinical"
+    • Asks to compare or further filter results from the last query
+    • Refers to a specific number or label mentioned earlier (e.g., "of the 31...", "those with Stephanie's approval", etc.)
 
-- If follow-up:
-    - Fill in any missing filters (status, timeframe, vendor, etc.) from the scope.
-- If new topic:
-    - Set is_followup=false.
-    - Suggest which scope keys to reset in "reset_keys" (e.g., timeframe, vendor, status, department, ids).
-    - Do NOT carry over old filters.
+- You MUST mark is_followup = false if:
+    • The user changes the subject entirely (e.g., from executed → imported, or contracts → spend)
+    • The user introduces a completely new timeframe, vendor, or entity that shifts focus away from the previous query
+    • The new question can be interpreted cleanly without prior context and has no dependency on previous scope
+
+-- SCOPE INHERITANCE --
+
+- If follow-up = true:
+    • Automatically inherit any active filters from the previous scope, unless they are explicitly overridden
+    • Always keep filters like: status, timeframe, vendor, department, record_type, approver, step, priority
+    • If the user changes one of those (e.g., “Q1” instead of “this year”), update scope_updates with the new value and include the old key in reset_keys
+
+-- SCOPE RESETTING --
+
+- If follow-up = false:
+    • Do not inherit filters from the prior scope
+    • Set reset_keys to remove any now-irrelevant filters (e.g., timeframe, vendor, department, step)
+    • Only keep what the user explicitly says
+
+-- RESOLVED QUESTION QUALITY --
+
+- The resolved_question must be a fully stand-alone version of the user’s message, clearly specifying all filters, even if inherited
+- Do not use vague pronouns like “those” or “them” — rewrite into exact, clear scope
 
 OUTPUT STRICT JSON ONLY:
 {
   "is_followup": true|false,
   "resolved_question": "fully self-contained question string",
-  "scope_updates": { "timeframe": "...", "status": "...", "vendor": "...", "ids": ["..."] },
-  "reset_keys": ["timeframe","vendor"],
+  "scope_updates": { "timeframe": "...", "status": "...", "vendor": "...", "approver": "...", "priority": "...", "record_type": "...", "step": "...", "department": "...", "ids": ["..."] },
+  "reset_keys": ["timeframe", "vendor", "status", "record_type", ...],
   "topic_label": "short_topic_name",
-  "notes": "brief rationale"
+  "notes": "brief rationale explaining why this is or isn't a follow-up"
 }
 """
+
 
 
 def history_selector(prior_summary: Optional[str],
@@ -762,8 +797,13 @@ def answer_question(
             out.append(t)
             acc += len(t)
         stream = stream_contract_summary_from_text(
-            {"retrieval": "ordered_chunks", "readable_id": rid, "question": resolved_q}
-        )
+        {
+            "retrieval": "ordered_chunks",
+            "readable_id": rid,
+            "question": resolved_q,
+            "texts": out  # ← this now includes the actual content
+        }
+)
         # Update state (primary_response is a text anchor for this turn)
         new_primary = {
             "type": "text",
