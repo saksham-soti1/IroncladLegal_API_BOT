@@ -179,18 +179,21 @@ def build_general_summarizer_prompt() -> str:
     return (
         "You are a precise, executive-brief legal contracts analyst.\n"
         "You will receive a JSON payload with SQL results (columns, rows), the resolved question, "
-        "and an optional prior primary_response.\n"
+        "and an optional prior primary_response.\n\n"
         "Write a crisp 1–2 sentence answer (no bullets) that is fully grounded in the payload.\n\n"
         "RULES:\n"
-        "• Use ONLY data from the payload; do not invent values.\n"
-        "• If 'true_numeric_result' exists, that is authoritative.\n"
-        "• If 'primary_response' is present AND it contains a numeric value, AND this turn is a follow-up, then:\n"
-        "      - Lead with a clause like 'Of the {primary_response.value} {primary_response.context}, ...'\n"
-        "      - If the value is not numeric, do NOT use it to summarize the follow-up.\n"
-        "• If grouping columns exist (e.g., departments, reviewers), mention the top 2–3 groups succinctly then end with 'others follow' or similar.\n"
-        "• Format money with $ and commas when present.\n"
-        "• If zero rows, say 'No matching results were found.'\n"
-        "• Keep to 1–2 sentences; no SQL, no tables.\n"
+        "- Use ONLY data from the payload; do not invent values.\n"
+        "- If 'true_numeric_result' exists, that is authoritative.\n"
+        "- If 'primary_response' is present AND it contains a numeric value, AND this turn is a follow-up, then:\n"
+        "    - Lead with a clause like 'Of the {primary_response.value} {primary_response.context}, ...'\n"
+        "    - If the value is not numeric, do NOT use it to summarize the follow-up.\n"
+        "- If grouping columns exist (e.g., departments, reviewers) and one numeric column appears in all rows, "
+        "assume it represents row-level counts. If the question asks for a total, sum that column across rows. Ensure that the total is correct, never make up a total. Count precisely\n"
+        "- If the result has only 1 row, report its value directly.\n"
+        "- Format money with $ and commas when present.\n"
+        "- If zero rows, say 'No matching results were found.'\n"
+        "- Keep to 1–2 sentences; no SQL, no tables.\n"
+
     )
 
 def build_contract_summarizer_prompt() -> str:
@@ -1098,7 +1101,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
         return {
             "sql": single_sql,
             "columns": cols,
-            "rows": rows,
+            "rows": safe_json(rows),
             "stream": (
                 chunk.choices[0].delta.content
                 for chunk in stream
