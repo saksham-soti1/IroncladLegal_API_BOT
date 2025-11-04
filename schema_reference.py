@@ -150,9 +150,17 @@ Time windows (always anchor to CURRENT_DATE):
     a.end_time >= date_trunc('year', CURRENT_DATE)
     AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
 - Week:
-    a.end_time >= CURRENT_DATE - INTERVAL '7 days'
-    AND a.end_time < CURRENT_DATE
-- If no timeframe is given → no date filter.
+  Clarify "this week" vs "last 7 days" (workflow logic):
+  - "This week" = calendar week-to-date, using:
+      w.created_at >= date_trunc('week', CURRENT_DATE)
+      AND w.created_at < CURRENT_DATE
+  - "Last 7 days" = rolling 7-day window, using:
+      w.created_at >= CURRENT_DATE - INTERVAL '7 days'
+      AND w.created_at < CURRENT_DATE
+  - These are NOT interchangeable.
+    • Use "this week" logic only if the user says: “this week”, “week to date”, “since Monday”.
+    • Use "last 7 days" logic only if the user says: “past 7 days”, “last 7 days”, “in the last week”.
+  - If the user does NOT specify a timeframe, do not apply a date filter.
 
 Workflow scope:
 - If user says “in progress” → add w.status='active'.
@@ -253,11 +261,77 @@ Important:
 - Always anchor to CURRENT_DATE and align with calendar quarters.
 
 Financial rules
-- “Spend/total spend” → use contract_value_amount only.
-- “Estimated cost”    → use estimated_cost_amount only.
+- All “spend / total value / contract value” totals MUST be normalized to USD.
+- Always JOIN ic.currency_exchange_rates r ON r.currency = w.contract_value_currency.
+- Always SUM (w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) as the USD total.
+- When filtering for executed/signed, use (w.status='completed' OR w.attributes ? 'importId') and use w.execution_date for time windows.
+- Never SUM raw w.contract_value_amount across mixed currencies unless the user explicitly says “don’t convert”.
+- If a rate is missing, treat it as USD (COALESCE to 1.0) and include a short note like “(1 currency used default USD rate)”.
+- “Estimated cost” → use estimated_cost_amount only.
 - ❌ Do not COALESCE actual + estimated unless explicitly asked.
-- Currency handling:
-  If summing across multiple currencies, either group by currency or state that totals mix currencies.
+
+Currency normalization:
+- Use the ic.currency_exchange_rates table to convert all contract_value_amount to USD.
+- Table: ic.currency_exchange_rates
+  • currency (TEXT, PK)  — e.g., 'USD', 'EUR', 'CHF', 'CAD'
+  • rate_to_usd (NUMERIC) — multiply this by contract_value_amount to get USD
+
+- Join pattern:
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+
+- Conversion rule:
+    w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)
+
+- Always apply the exchange rate multiplication when summing contract_value_amount.
+- Never sum raw contract_value_amount directly unless explicitly asked for native currency totals.
+- All financial totals must default to normalized USD output.
+
+- Example (total USD-normalized contract value this year):
+    SELECT
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date >= date_trunc('year', CURRENT_DATE)
+      AND w.execution_date <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
+      AND w.contract_value_amount IS NOT NULL;
+
+- Example (breakdown by currency showing native and USD totals):
+    SELECT
+      w.contract_value_currency                                   AS currency,
+      SUM(w.contract_value_amount)                                AS native_total,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS usd_total
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date >= DATE '2025-01-01'
+      AND w.execution_date <  DATE '2026-01-01'
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY w.contract_value_currency
+    ORDER BY usd_total DESC NULLS LAST;
+
+- Example (spend by department with normalized USD totals):
+    SELECT
+      COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified') AS department_clean,
+      COUNT(*) AS contracts,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    LEFT JOIN ic.department_map dm
+      ON UPPER(TRIM(w.department)) = UPPER(dm.raw_value)
+    LEFT JOIN ic.department_canonical c1
+      ON UPPER(TRIM(w.department)) = UPPER(c1.canonical_value)
+    LEFT JOIN ic.department_canonical c2
+      ON UPPER(TRIM(w.owner_name)) = UPPER(c2.canonical_value)
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY department_clean
+    ORDER BY total_value_usd DESC NULLS LAST;
+
 
 -- Duration & Average Time Calculations
 When a user asks about:
