@@ -191,7 +191,7 @@ def build_general_summarizer_prompt() -> str:
         "assume it represents row-level counts. If the question asks for a total, sum that column across rows. Ensure that the total is correct, never make up a total. Count precisely\n"
         "- If the result has only 1 row, report its value directly.\n"
         "- Format money with $ and commas when present.\n"
-        "- If zero rows, say 'No matching results were found.'\n"
+        "- If zero rows, say 'No matching results were found, meaning no data was found for the given filters.'\n"
         "- Keep to 1–2 sentences; no SQL, no tables.\n"
 
     )
@@ -201,7 +201,7 @@ def build_contract_summarizer_prompt() -> str:
         "You are a legal contract summarizer.\n"
         "You will receive a list of ordered text chunks under 'texts' for a single contract.\n"
         "Write a professional, structured summary titled 'Summary for <readable_id>'.\n"
-        "First are foremost, write a short summary of the contract in a few sentences.\n"
+        "First and foremost, write a short summary of the contract in a few sentences. Make sure its descriptive and captures the essence of the entirety of the contract.\n"
         "Include key sections ONLY when present:\n"
         "- Parties (who is involved)\n"
         "- Term (start + duration)\n"
