@@ -76,15 +76,48 @@ DEPARTMENT LOGIC:
 - Never hardcode department names; rely only on mapping + canonical list.
 
 
-- owner (TEXT): The workflow owner must always be retrieved from ic.role_assignees
-  - Use ra.user_name from ic.role_assignees where role_id = 'owner'
-  - Join using:
+- Ownership & Submitter Fields
 
-      JOIN ic.role_assignees ra
-        ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
+  In Ironclad, “owner” can mean different things depending on context:
 
-  - Never use w.owner_name — it is unreliable and often null
-  - Always group by or filter using ra.user_name
+  • **Workflow Owner** → The person *currently assigned* as the owner of the workflow.  
+    - Source: ic.role_assignees where role_id = 'owner'  
+    - Always JOIN like:
+        JOIN ic.role_assignees ra
+          ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
+    - Use ra.user_name (or ra.email if needed).  
+    - This name matches the “Owned by ___” field at the top of the Ironclad UI.
+    - If a user asks “who owns workflow IC-####” or “workflow owner,” always pull from role_assignees.
+  
+  • **Workflow Creator / Submitted By / Contract Owner** → The person who originally submitted or launched the workflow form.  
+    - Source: JSON attributes on ic.workflows  
+        • Name:  w.attributes->>'ownerName'  
+        • Email: w.attributes->>'requesterEmail'  
+    - This person may differ from the workflow owner if the workflow was submitted on behalf of someone else.  
+    - If a user asks “who submitted this,” “who created this workflow,” or “who is the contract owner,” use attributes->>'ownerName'.  
+    - These fields populate the **“Contract Owner Name”** and **“Contract Owner (email)”** sections in the Ironclad UI.
+      - Some workflows, especially imported or legacy records, may not include an 'ownerName' field in attributes.
+        Always exclude NULL or blank values when counting or grouping by submitter.
+        Example filter:
+            WHERE w.attributes->>'ownerName' IS NOT NULL AND w.attributes->>'ownerName' <> ''
+
+  
+  • **Quick summary of routing logic:**
+    - “workflow owner”, “owned by”, “record owner” → use role_assignees (role_id='owner')
+    - “who submitted”, “who created”, “contract owner” → use attributes->>'ownerName'
+  
+  Example SQL patterns:
+    -- Workflow owner
+    SELECT ra.user_name AS workflow_owner
+    FROM ic.workflows w
+    JOIN ic.role_assignees ra
+      ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
+    WHERE w.readable_id = 'IC-6898';
+
+    -- Contract owner / workflow creator
+    SELECT w.attributes->>'ownerName' AS contract_owner_name
+    FROM ic.workflows w
+    WHERE w.readable_id = 'IC-6898';
 
 - paper_source (TEXT)
 - document_type (TEXT)          -- not the contract type category
@@ -332,6 +365,8 @@ Currency normalization:
     GROUP BY department_clean
     ORDER BY total_value_usd DESC NULLS LAST;
 
+Least expensive or lowest-value contract:
+- When finding the least expensive or lowest-value contract, always exclude any records where contract_value_amount <= 0 or contract_value_amount IS NULL. These represent incomplete or placeholder entries that should not be counted as valid contract values.
 
 -- Duration & Average Time Calculations
 When a user asks about:
