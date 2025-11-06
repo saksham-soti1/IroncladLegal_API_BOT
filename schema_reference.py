@@ -412,7 +412,71 @@ Least expensive or lowest-value contract:
 
 Spend trend and time comparisons:
 - When comparing total spend, contract value, or total value between **years**, **quarters**, or **months**, 
-  always use execution_date for completed contracts and normalize all values to USD.
+  always use the unified completion timestamp logic to ensure imported workflows are handled correctly.
+
+  ✅ Completion timestamp rule:
+      CASE
+        WHEN w.attributes ? 'importId' THEN w.execution_date
+        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      END
+
+- Always include both conditions for executed contracts:
+    (w.status = 'completed' OR w.attributes ? 'importId')
+    AND contract_value_amount IS NOT NULL
+
+- Always JOIN currency exchange rates for USD normalization:
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+
+- Base calculation for any period:
+    SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+
+- ✅ Example (completed contracts by record type in the last 6 months):
+    WITH wf AS (
+      SELECT
+        w.record_type,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
+    SELECT COALESCE(record_type, 'Unspecified Type') AS record_type,
+           COUNT(*) AS contracts_completed
+    FROM wf
+    WHERE (status = 'completed' OR (attributes ? 'importId'))
+      AND completion_ts IS NOT NULL
+      AND completion_ts >= CURRENT_DATE - INTERVAL '6 months'
+      AND completion_ts < CURRENT_DATE
+    GROUP BY record_type
+    ORDER BY contracts_completed DESC;
+
+- ✅ Year / Quarter / Month comparisons follow the same rule:
+    Replace execution_date with completion_ts as defined above.
+    Example:
+    ```sql
+    WITH wf AS (
+      SELECT
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts,
+        w.contract_value_amount,
+        w.contract_value_currency
+      FROM ic.workflows w
+    )
+    SELECT 
+      EXTRACT(YEAR FROM completion_ts)::INT AS year,
+      SUM(wf.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM wf
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = wf.contract_value_currency
+    WHERE completion_ts IS NOT NULL
+    GROUP BY year
+    ORDER BY year;
+    ```
 
 - Always include both conditions for executed contracts:
     (w.status = 'completed' OR w.attributes ? 'importId')
@@ -498,30 +562,106 @@ Spend trend and time comparisons:
 -- Duration & Average Time Calculations
 When a user asks about:
 - “average time to complete a contract”
-- “average time from creation to execution”
+- “average time from creation to completion/execution”
 - “average lifecycle duration”
 - “average created-to-completed days”
+- “which department takes the longest to complete workflows”
 or any similar timing or duration metric,
-always compute the difference between execution_date (end of workflow) and created_at (start of workflow).
+always compute the difference between creation and completion using the unified completion timestamp logic.
 
-Use this pattern (returns average number of days):
+✅ Unified completion timestamp rule:
+    CASE
+      WHEN w.attributes ? 'importId' THEN w.execution_date
+      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+    END AS completion_ts
 
-    SELECT
-        ROUND(AVG(EXTRACT(EPOCH FROM (execution_date - created_at)) / 86400)::numeric, 2)
-        AS average_days_to_complete
-    FROM ic.workflows
-    WHERE status = 'completed'
-      AND execution_date IS NOT NULL
-      AND created_at IS NOT NULL;
+✅ Calculation rules:
+- Always include workflows where (status = 'completed' OR attributes ? 'importId').
+- Exclude rows where either created_at or completion_ts is NULL.
+- Use EXTRACT(EPOCH FROM (...)) / 86400 to compute duration in days, rounded to 2 decimals.
+- When grouping by department, normalize department names via ic.department_map and ic.department_canonical.
+- Exclude departments with NULL or invalid average values when ranking.
+- When grouping by department (or joining to department tables), the CTE must SELECT w.department and w.owner_name.
+- Never use COALESCE(w.execution_date, w.last_updated_at) without w.workflow_completed_at; always use
+  COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at) in both SELECT and WHERE.
 
-Alternate representation (if an interval is requested instead of numeric days):
+-- ✅ Example (average number of days to complete per department)
+WITH wf AS (
+  SELECT
+    w.workflow_id,
+    w.status,
+    w.department,
+    w.owner_name,
+    w.created_at,
+    CASE
+      WHEN w.attributes ? 'importId' THEN w.execution_date
+      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+    END AS completion_ts
+  FROM ic.workflows w
+  WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+    AND (
+      CASE
+        WHEN w.attributes ? 'importId' THEN w.execution_date
+        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      END
+    ) IS NOT NULL
+)
+SELECT
+  COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified') AS department_clean,
+  ROUND(AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric, 2) AS average_days_to_complete
+FROM wf
+LEFT JOIN ic.department_map dm
+  ON UPPER(TRIM(wf.department)) = UPPER(dm.raw_value)
+LEFT JOIN ic.department_canonical c1
+  ON UPPER(TRIM(wf.department)) = UPPER(c1.canonical_value)
+LEFT JOIN ic.department_canonical c2
+  ON UPPER(TRIM(wf.owner_name)) = UPPER(c2.canonical_value)
+WHERE wf.created_at IS NOT NULL
+  AND wf.completion_ts IS NOT NULL
+GROUP BY department_clean
+HAVING ROUND(AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric, 2) IS NOT NULL
+ORDER BY average_days_to_complete DESC
+LIMIT 5;
 
-    SELECT
-        justify_interval(AVG(execution_date - created_at)) AS average_duration
-    FROM ic.workflows
-    WHERE status = 'completed'
-      AND execution_date IS NOT NULL
-      AND created_at IS NOT NULL;
+✅ Why:
+- Matches the verified working pgAdmin SQL.
+- Includes both completed and imported workflows with valid completion timestamps.
+- Excludes incomplete or null data.
+- Normalizes department names for clean grouping.
+- Returns departments ranked by average completion time in days.
+
+-- Alternate representation (interval format)
+-- Note: This example intentionally omits w.department / w.owner_name.
+-- Do not reuse it for department-level questions. It only provides overall averages.
+
+WITH wf AS (
+  SELECT
+    w.workflow_id,
+    w.status,
+    w.created_at,
+    CASE
+      WHEN w.attributes ? 'importId' THEN w.execution_date
+      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+    END AS completion_ts
+  FROM ic.workflows w
+  WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+    AND (
+      CASE
+        WHEN w.attributes ? 'importId' THEN w.execution_date
+        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      END
+    ) IS NOT NULL
+)
+SELECT
+  justify_interval(AVG(wf.completion_ts - wf.created_at)) AS average_duration
+FROM wf
+WHERE wf.created_at IS NOT NULL
+  AND wf.completion_ts IS NOT NULL;
+
+✅ Why:
+- Provides interval-based output (e.g., “42 days 12:00:00”).
+- Useful when users request formatted time durations instead of numeric days.
+
 
 Guidance:
 - Use last_updated_at as the default completion timestamp for “completed”/“signed”/“executed”/“finished” workflows.
@@ -859,6 +999,8 @@ Notes:
 
 - Do not attempt: ARRAY_AGG(readable_id ORDER BY readable_id LIMIT 5)  ← this will error.
 
+
+
 -- =========================
 -- WEEKLY REPORT AND LEGAL METRICS
 -- =========================
@@ -874,17 +1016,29 @@ the model should compose and execute the following queries (individually, in ord
 The report covers rolling windows relative to CURRENT_DATE.
 
 1. Contracts Completed with Legal Review (Last 14 Days)
-    SELECT COUNT(DISTINCT w.workflow_id) AS contracts_completed_with_named_legal_review
-    FROM ic.workflows w
-    WHERE w.status = 'completed'
-      AND w.execution_date >= CURRENT_DATE - INTERVAL '13 days'
-      AND w.execution_date < CURRENT_DATE
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
+    SELECT COUNT(DISTINCT wf.workflow_id) AS contracts_completed_with_named_legal_review
+    FROM wf
+    WHERE (status = 'completed' OR (attributes ? 'importId'))
+      AND completion_ts IS NOT NULL
+      AND completion_ts >= CURRENT_DATE - INTERVAL '13 days'
+      AND completion_ts < CURRENT_DATE
       AND EXISTS (
         SELECT 1
         FROM ic.approval_requests a
         JOIN ic.role_assignees ra
           ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-        WHERE a.workflow_id = w.workflow_id
+        WHERE a.workflow_id = wf.workflow_id
           AND LOWER(a.status) = 'approved'
           AND (
             LOWER(ra.user_name) ILIKE '%matthew bradley%'
@@ -947,14 +1101,26 @@ The report covers rolling windows relative to CURRENT_DATE.
       AND LOWER(title) LIKE '%nda%';
 
 7. Weekly Legal Team – Contracts Completed by Reviewer (Last 14 Days)
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
     SELECT ra.user_name AS reviewer_name,
-           COUNT(DISTINCT w.workflow_id) AS contracts_completed_last_14_days
-    FROM ic.workflows w
-    JOIN ic.approval_requests a ON a.workflow_id = w.workflow_id
+           COUNT(DISTINCT wf.workflow_id) AS contracts_completed_last_14_days
+    FROM wf
+    JOIN ic.approval_requests a ON a.workflow_id = wf.workflow_id
     JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-    WHERE w.status = 'completed'
-      AND w.execution_date >= CURRENT_DATE - INTERVAL '13 days'
-      AND w.execution_date < CURRENT_DATE
+    WHERE (wf.status = 'completed' OR (wf.attributes ? 'importId'))
+      AND wf.completion_ts IS NOT NULL
+      AND wf.completion_ts >= CURRENT_DATE - INTERVAL '13 days'
+      AND wf.completion_ts < CURRENT_DATE
       AND LOWER(a.status) = 'approved'
       AND (
         LOWER(ra.user_name) ILIKE '%matthew bradley%'
@@ -1003,38 +1169,68 @@ The report covers rolling windows relative to CURRENT_DATE.
     ORDER BY workflow_count DESC;
 
 10. Work Completed by Department (Past 12 Months)
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
     SELECT department_clean,
            COUNT(DISTINCT workflow_id) AS workflows_completed_last_year
     FROM (
-      SELECT w.workflow_id,
+      SELECT wf.workflow_id,
              COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean
-      FROM ic.workflows w
-      LEFT JOIN ic.department_map dm ON UPPER(TRIM(w.department))=UPPER(dm.raw_value)
-      LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(w.department))=UPPER(c1.canonical_value)
-      LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(w.owner_name))=UPPER(c2.canonical_value)
-      WHERE w.execution_date >= CURRENT_DATE - INTERVAL '12 months'
-        AND LOWER(w.status)='completed'
+      FROM wf
+      LEFT JOIN ic.department_map dm ON UPPER(TRIM(wf.attributes->>'department'))=UPPER(dm.raw_value)
+      LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(wf.attributes->>'department'))=UPPER(c1.canonical_value)
+      LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(wf.attributes->>'ownerName'))=UPPER(c2.canonical_value)
+      WHERE wf.completion_ts >= CURRENT_DATE - INTERVAL '12 months'
+        AND (wf.status = 'completed' OR (wf.attributes ? 'importId'))
     ) x
     GROUP BY department_clean
     ORDER BY workflows_completed_last_year DESC NULLS LAST;
 
 11. Work Completed by Sum of Contract Value (Past 12 Months)
-    SELECT department_clean,
-           SUM(contract_value_amount) AS total_contract_value_last_year
-    FROM (
-      SELECT w.workflow_id,
-             COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean,
-             w.contract_value_amount
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts,
+        w.contract_value_amount,
+        w.contract_value_currency
       FROM ic.workflows w
-      LEFT JOIN ic.department_map dm ON UPPER(TRIM(w.department))=UPPER(dm.raw_value)
-      LEFT JOIN ic.department_canonical c1 ON UPPER(TRIM(w.department))=UPPER(c1.canonical_value)
-      LEFT JOIN ic.department_canonical c2 ON UPPER(TRIM(w.owner_name))=UPPER(c2.canonical_value)
-      WHERE w.execution_date >= CURRENT_DATE - INTERVAL '12 months'
-        AND LOWER(w.status)='completed'
-        AND w.contract_value_amount IS NOT NULL
-    ) x
+    )
+    SELECT department_clean,
+           SUM(wf.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_contract_value_usd_last_year
+    FROM (
+      SELECT wf.workflow_id,
+             wf.contract_value_amount,
+             wf.contract_value_currency,
+             COALESCE(dm.canonical_value,c1.canonical_value,c2.canonical_value,'Department not specified') AS department_clean
+      FROM wf
+      LEFT JOIN ic.department_map dm
+        ON UPPER(TRIM(wf.attributes->>'department')) = UPPER(dm.raw_value)
+      LEFT JOIN ic.department_canonical c1
+        ON UPPER(TRIM(wf.attributes->>'department')) = UPPER(c1.canonical_value)
+      LEFT JOIN ic.department_canonical c2
+        ON UPPER(TRIM(wf.attributes->>'ownerName'))  = UPPER(c2.canonical_value)
+      WHERE wf.completion_ts >= CURRENT_DATE - INTERVAL '12 months'
+        AND (wf.status = 'completed' OR (wf.attributes ? 'importId'))
+        AND wf.contract_value_amount IS NOT NULL
+    ) wf
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = wf.contract_value_currency
     GROUP BY department_clean
-    ORDER BY total_contract_value_last_year DESC NULLS LAST;
+    ORDER BY total_contract_value_usd_last_year DESC NULLS LAST;
 
 Formatting guidance:
 - Present results as a single weekly report summary.
