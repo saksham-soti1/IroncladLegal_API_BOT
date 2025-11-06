@@ -479,7 +479,7 @@ Always return STRICT JSON in this format:
 ## INTENT DEFINITIONS AND EXAMPLES:
 
 ### 🔹 text_mention_count  
-Count how many contracts contain specific **words or phrases in the text**.
+Count how many contracts contain specific **words or phrases in the tet**.
 
 **Trigger phrases:**  
 - “how many contracts mention…”  
@@ -569,12 +569,28 @@ Use when the user is describing a **concept** they want to find, not a specific 
 ---
 
 ### 🔹 weekly_report  
-User requests a summary of recent activity (e.g., new workflows, approvals, completions this week).
+User explicitly requests the **full Legal & Contract Weekly Report** — a structured summary of multiple metrics (the 11-section bundle).
 
-**Trigger phrases:**  
-- “what happened this week”  
-- “show me a summary of recent contracts”  
-- “weekly activity summary”
+Only classify as `weekly_report` when the user clearly asks for a **formal report or overview**, not just when they mention a timeframe.
+
+**Trigger phrases (explicit requests only):**
+- “generate the weekly report”
+- “create the weekly legal report”
+- “show me the full weekly report”
+- “make the weekly report”
+- “weekly report for legal team”
+- “give me the legal team report”
+- “generate the full report for this week”
+
+**Do NOT use this intent** for general time-based questions such as:
+- “how many contracts were created this week”
+- “show contracts completed this week”
+- “what’s the spend this week”
+Those should remain `sql_generic`.
+
+In summary:
+- `weekly_report` = user explicitly wants the multi-section weekly summary.
+- `sql_generic` = any normal analytical or timeframe question (even if it includes 'week' or 'weekly').
 
 ---
 
@@ -784,87 +800,57 @@ def answer_question(
     # ===========================================
     # Summarize a single contract (RAG text path)
     # ===========================================
-    if intent["intent"] == "summarize_contract" and intent.get("readable_ids"):
-        rid = intent["readable_ids"][0]
-        cols, rows = run_sql(
-            "SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",
-            (rid,),
-            max_rows=5000,
-        )
-        texts = [r[1] for r in rows]
-        acc = 0
-        out = []
-        for t in texts:
-            if acc + len(t) > 180_000:
-                break
-            out.append(t)
-            acc += len(t)
-        stream = stream_contract_summary_from_text(
-        {
-            "retrieval": "ordered_chunks",
-            "readable_id": rid,
-            "question": resolved_q,
-            "texts": out  # ← this now includes the actual content
-        }
-)
-        # Update state (primary_response is a text anchor for this turn)
-        new_primary = {
-            "type": "text",
-            "value": f"Summary generated for {rid}",
-            "context": f"contract {rid}"
-        }
-        return {
-            "sql": "",
-            "columns": [],
-            "rows": [],
-            "stream": stream,
-            "intent_json": intent,
-            "conversation_summary": updated_summary,
-            "scope": scope,
-            "resolved_question": resolved_q,
-            "primary_response": new_primary
-        }
+    # ===========================================
+# Summarize a single contract (RAG text path)
+# ===========================================
+    # ===========================================
+    # Summarize a single contract (RAG text path)
+    # ===========================================
+    if intent["intent"] == "summarize_contract":
+        # If no explicit IC id was given, try to reuse the last turn's example_ids
+        if not intent.get("readable_ids"):
+            prior_ids = (primary_response or {}).get("example_ids") or []
+            if isinstance(prior_ids, (list, tuple)) and prior_ids:
+                intent["readable_ids"] = [prior_ids[0]]
 
-    # ===========================================
-    # Compare two contracts (RAG text path)
-    # ===========================================
-    if intent["intent"] == "compare_contracts" and len(intent.get("readable_ids", [])) >= 2:
-        a, b = intent["readable_ids"][:2]
-        def grab(rid):
-            c, r = run_sql(
+        # Only proceed if we now have an ID
+        if intent.get("readable_ids"):
+            rid = intent["readable_ids"][0]
+            cols, rows = run_sql(
                 "SELECT chunk_id,chunk_text FROM ic.contract_chunks WHERE readable_id=%s ORDER BY chunk_id",
                 (rid,),
                 max_rows=5000,
             )
-            texts = [x[1] for x in r]
-            acc = 0
-            out = []
+            texts = [r[1] for r in rows]
+            acc, out = 0, []
             for t in texts:
-                if acc + len(t) > 120_000:
+                if acc + len(t) > 180_000:
                     break
                 out.append(t)
                 acc += len(t)
-            return out
-        stream = stream_contract_summary_from_text(
-            {"retrieval": "compare", "ids": [a, b], "question": resolved_q,
-             "texts": ["\n".join(grab(a)), "\n".join(grab(b))]}
-        )
-        new_primary = {
-            "type": "text",
-            "value": f"Comparison generated for {a} vs {b}",
-            "context": f"{a} vs {b}"
-        }
-        return {
-            "sql": "",
-            "columns": [],
-            "rows": [],
-            "stream": stream,
-            "intent_json": intent,
-            "conversation_summary": updated_summary,
-            "scope": scope,
-            "resolved_question": resolved_q,
-            "primary_response": new_primary
-        }
+
+            stream = stream_contract_summary_from_text(
+                {
+                    "retrieval": "ordered_chunks",
+                    "readable_id": rid,
+                    "question": resolved_q,
+                    "texts": out
+                }
+            )
+
+            new_primary = {"type": "text", "value": f"Summary generated for {rid}", "context": f"contract {rid}"}
+            return {
+                "sql": "",
+                "columns": [],
+                "rows": [],
+                "stream": stream,
+                "intent_json": intent,
+                "conversation_summary": updated_summary,
+                "scope": scope,
+                "resolved_question": resolved_q,
+                "primary_response": new_primary
+            }
+
 
     # ===========================================
     # Text mention count (keyword Boolean)
@@ -884,6 +870,11 @@ def answer_question(
          ARRAY(SELECT readable_id FROM matches ORDER BY readable_id LIMIT 5) AS example_ids
 FROM matches"""
         cols, rows = run_sql(sql, tuple(inc_params + not_params))
+        # NEW: capture example_ids (array of readable_ids) for follow-ups like "summarize it"
+        example_ids = []
+        if rows and 'example_ids' in cols:
+            _idx = cols.index('example_ids')
+            example_ids = rows[0][_idx] or []
         # Build exec-brief stream with prior anchor if follow-up
         numeric_value = None
         if len(rows) == 1 and len(cols) == 1 and isinstance(rows[0][0], (int,float,Decimal)):
@@ -902,8 +893,10 @@ FROM matches"""
         new_primary = {
             "type": "numeric" if numeric_value is not None else "text",
             "value": numeric_value if numeric_value is not None else "",
-            "context": resolved_q
+            "context": resolved_q,
+            "example_ids": example_ids  # carry IDs forward for follow-ups
         }
+
         return {
             "sql": sql,
             "columns": cols,
