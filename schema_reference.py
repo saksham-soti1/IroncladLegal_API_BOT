@@ -12,10 +12,44 @@ Table: workflows
 - status (TEXT)
   ✅ Completed workflows → 'completed'
   ✅ In-progress workflows → 'active'
-  ✅ "Executed", "signed", or "finished" contracts are defined as:
+✅ "Executed", "signed", or "finished" contracts are defined as:
      status = 'completed' OR attributes ? 'importId'
-     (Imported workflows should be considered executed even if status is not 'completed')
-     Always include both conditions in the WHERE clause when filtering for executed contracts.
+     (Imported workflows should be considered executed if they have a real executed or finished date.)
+
+  ✅ When counting or filtering by completion time (e.g., “completed in the last 30 days”, “completed this year”),
+     use a unified completion timestamp that distinguishes between imported and native records.
+
+  ✅ Completion logic pattern:
+      • For normal Ironclad workflows:
+          use COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      • For imported contracts (attributes ? 'importId'):
+          only include those with a true executed date, e.g. w.execution_date.
+
+  ✅ Example pattern (safe completion timestamp logic):
+      ```sql
+      WITH wf AS (
+        SELECT
+          w.status,
+          w.attributes,
+          CASE
+            WHEN w.attributes ? 'importId' THEN w.execution_date
+            ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          END AS completion_ts
+        FROM ic.workflows w
+      )
+      SELECT COUNT(*)
+      FROM wf
+      WHERE
+        (status = 'completed' OR (attributes ? 'importId'))
+        AND completion_ts IS NOT NULL
+        AND completion_ts >= CURRENT_DATE - INTERVAL '30 days'
+        AND completion_ts <  CURRENT_DATE;
+      ```
+
+  ✅ Why:
+      This avoids including imported contracts that have no true completion date,
+      and still uses last_updated_at for native workflows where execution_date may be null.
+
   ❌ Do not filter by 'In Progress' (not a stored value)
 
 - step (TEXT)  -- only present for in-progress
@@ -301,7 +335,11 @@ Financial rules
 - All “spend / total value / contract value” totals MUST be normalized to USD.
 - Always JOIN ic.currency_exchange_rates r ON r.currency = w.contract_value_currency.
 - Always SUM (w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) as the USD total.
-- When filtering for executed/signed, use (w.status='completed' OR w.attributes ? 'importId') and use w.execution_date for time windows.
+- When filtering for executed/signed, use (w.status='completed' OR w.attributes ? 'importId') 
+  but apply the unified completion logic for time windows (see status section).
+  For spend or contract value analysis, use COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+  for native workflows, and w.execution_date for imported ones only if execution_date is not null.
+
 - Never SUM raw w.contract_value_amount across mixed currencies unless the user explicitly says “don’t convert”.
 - If a rate is missing, treat it as USD (COALESCE to 1.0) and include a short note like “(1 currency used default USD rate)”.
 - “Estimated cost” → use estimated_cost_amount only.
@@ -486,7 +524,9 @@ Alternate representation (if an interval is requested instead of numeric days):
       AND created_at IS NOT NULL;
 
 Guidance:
-- Use execution_date for all “completed”/“signed”/“executed”/“finished” timestamps.
+- Use last_updated_at as the default completion timestamp for “completed”/“signed”/“executed”/“finished” workflows.
+  If last_updated_at is NULL, fall back to execution_date.
+  This ensures consistency across imported and manually completed workflows.
 - Never use workflow_completed_at (not present in schema).
 - Exclude NULL timestamps with “IS NOT NULL”.
 - Default output should be in days (numeric, rounded to 2 decimals).
@@ -501,6 +541,43 @@ To compute shortest or longest contract duration:
     WHERE status = 'completed'
       AND execution_date IS NOT NULL
       AND created_at IS NOT NULL;
+
+
+Completion timestamp logic:
+- Always interpret "completed", "executed", or "finished" timeframes using the unified CASE-based completion logic
+  to distinguish between native and imported workflows.
+
+- completion_ts rule:
+    CASE
+      WHEN w.attributes ? 'importId' THEN w.execution_date
+      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+    END
+
+- Example query:
+    WITH wf AS (
+      SELECT
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId' THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
+    SELECT COUNT(*) AS completed_last_30_days
+    FROM wf
+    WHERE (status = 'completed' OR (attributes ? 'importId'))
+      AND completion_ts IS NOT NULL
+      AND completion_ts >= CURRENT_DATE - INTERVAL '30 days'
+      AND completion_ts < CURRENT_DATE;
+
+- Do not rely on last_updated_at alone; it often updates for reasons other than workflow completion.
+  Imported records should only count as completed if they have a valid execution_date.
+
+- When calculating completed workflows in time windows (e.g., last 30 days),
+  use the CASE-based completion timestamp logic described above to ensure imported contracts
+  are only counted if they have a valid executed date.
+
 
 Recommended SQL patterns (metadata)
 - Spend by department (actuals only):
