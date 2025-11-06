@@ -78,46 +78,50 @@ DEPARTMENT LOGIC:
 
 - Ownership & Submitter Fields
 
-  In Ironclad, “owner” can mean different things depending on context:
+  In Ironclad, ownership terminology can be confusing because several people can appear in different “owner” roles.  
+  The key distinction is that the **workflow owner / creator / submitter** are all the same person — the one tied to the `role_id='owner'` record in ic.role_assignees — while the **contract owner** comes from the workflow attributes (ownerName field).
 
-  • **Workflow Owner** → The person *currently assigned* as the owner of the workflow.  
-    - Source: ic.role_assignees where role_id = 'owner'  
-    - Always JOIN like:
+  • **Workflow Owner / Workflow Creator / Submitted By**
+    - Definition: The person currently assigned as the workflow owner **and** the person who originally submitted or created the workflow form.
+    - Source of truth: ic.role_assignees where role_id = 'owner'
+    - Join pattern:
         JOIN ic.role_assignees ra
           ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
-    - Use ra.user_name (or ra.email if needed).  
-    - This name matches the “Owned by ___” field at the top of the Ironclad UI.
-    - If a user asks “who owns workflow IC-####” or “workflow owner,” always pull from role_assignees.
-  
-  • **Workflow Creator / Submitted By / Contract Owner** → The person who originally submitted or launched the workflow form.  
-    - Source: JSON attributes on ic.workflows  
-        • Name:  w.attributes->>'ownerName'  
-        • Email: w.attributes->>'requesterEmail'  
-    - This person may differ from the workflow owner if the workflow was submitted on behalf of someone else.  
-    - If a user asks “who submitted this,” “who created this workflow,” or “who is the contract owner,” use attributes->>'ownerName'.  
-    - These fields populate the **“Contract Owner Name”** and **“Contract Owner (email)”** sections in the Ironclad UI.
-      - Some workflows, especially imported or legacy records, may not include an 'ownerName' field in attributes.
-        Always exclude NULL or blank values when counting or grouping by submitter.
-        Example filter:
-            WHERE w.attributes->>'ownerName' IS NOT NULL AND w.attributes->>'ownerName' <> ''
+    - Preferred fields: ra.user_name (display name) and ra.email if needed.
+    - This person appears in the Ironclad UI under “Owned by ___” and should also be used for any questions about:
+        “who owns this workflow”, “who submitted this workflow”, or “who created this workflow”.
+    - Never use w.owner_name or attributes->>'ownerName' for these — those are for the contract owner, not the workflow owner.
 
-  
-  • **Quick summary of routing logic:**
-    - “workflow owner”, “owned by”, “record owner” → use role_assignees (role_id='owner')
-    - “who submitted”, “who created”, “contract owner” → use attributes->>'ownerName'
-  
-  Example SQL patterns:
-    -- Workflow owner
+    Example:
+    ```sql
     SELECT ra.user_name AS workflow_owner
     FROM ic.workflows w
     JOIN ic.role_assignees ra
       ON ra.workflow_id = w.workflow_id AND ra.role_id = 'owner'
     WHERE w.readable_id = 'IC-6898';
+    ```
 
-    -- Contract owner / workflow creator
+  • **Contract Owner**
+    - Definition: The person listed as the “Contract Owner” in the launch form or metadata — responsible for the agreement itself, not the workflow.
+    - Source of truth: JSON attributes on ic.workflows
+        • Name:  w.attributes->>'ownerName'
+        • Email: w.attributes->>'requesterEmail'
+    - Appears in the Ironclad UI under “Contract Owner Name” and “Contract Owner (email)”.
+    - This may differ from the workflow owner if the form was submitted on behalf of another person.
+    - When the user asks “who is the contract owner”, “contract owner name”, or “contract owner email”, always use the attributes fields.
+    - Exclude null or blank values when grouping or counting by contract owner:
+        WHERE w.attributes->>'ownerName' IS NOT NULL AND w.attributes->>'ownerName' <> ''
+
+    Example:
+    ```sql
     SELECT w.attributes->>'ownerName' AS contract_owner_name
     FROM ic.workflows w
     WHERE w.readable_id = 'IC-6898';
+    ```
+
+  • **Quick summary of routing logic:**
+    - “workflow owner”, “who owns this”, “workflow creator”, “submitted by”, “who submitted this” → use ic.role_assignees (role_id='owner')
+    - “contract owner”, “contract owner name”, “contract owner email” → use w.attributes->>'ownerName' and w.attributes->>'requesterEmail'
 
 - paper_source (TEXT)
 - document_type (TEXT)          -- not the contract type category
@@ -367,6 +371,91 @@ Currency normalization:
 
 Least expensive or lowest-value contract:
 - When finding the least expensive or lowest-value contract, always exclude any records where contract_value_amount <= 0 or contract_value_amount IS NULL. These represent incomplete or placeholder entries that should not be counted as valid contract values.
+
+Spend trend and time comparisons:
+- When comparing total spend, contract value, or total value between **years**, **quarters**, or **months**, 
+  always use execution_date for completed contracts and normalize all values to USD.
+
+- Always include both conditions for executed contracts:
+    (w.status = 'completed' OR w.attributes ? 'importId')
+    AND w.contract_value_amount IS NOT NULL
+
+- The base calculation for any period is:
+    SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+
+- ✅ Year-over-year comparison:
+    Use EXTRACT(YEAR FROM w.execution_date) as year_key.
+    Example:
+    ```sql
+    SELECT 
+      EXTRACT(YEAR FROM w.execution_date)::INT AS year,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date IS NOT NULL
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY year
+    ORDER BY year;
+    ```
+
+- ✅ Quarter-over-quarter comparison:
+    Combine EXTRACT(YEAR FROM ...) and EXTRACT(QUARTER FROM ...) into one key.
+    Example:
+    ```sql
+    SELECT
+      CONCAT('Q', EXTRACT(QUARTER FROM w.execution_date), ' ', EXTRACT(YEAR FROM w.execution_date)) AS quarter,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date IS NOT NULL
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY quarter
+    ORDER BY MIN(w.execution_date);
+    ```
+
+- ✅ Month-over-month comparison:
+    Use TO_CHAR(w.execution_date, 'YYYY-MM') as the grouping key.
+    Example:
+    ```sql
+    SELECT 
+      TO_CHAR(w.execution_date, 'YYYY-MM') AS month,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date IS NOT NULL
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY month
+    ORDER BY month;
+    ```
+
+- ✅ Comparing two or more years directly (like “Was 2024 higher than 2025?”):
+    Use a WHERE clause that limits to those specific years:
+    ```sql
+    SELECT 
+      EXTRACT(YEAR FROM w.execution_date)::INT AS year,
+      SUM(w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) AS total_value_usd
+    FROM ic.workflows w
+    LEFT JOIN ic.currency_exchange_rates r
+      ON r.currency = w.contract_value_currency
+    WHERE (w.status = 'completed' OR w.attributes ? 'importId')
+      AND w.execution_date >= DATE '2024-01-01'
+      AND w.execution_date <  DATE '2026-01-01'
+      AND w.contract_value_amount IS NOT NULL
+    GROUP BY year
+    ORDER BY year;
+    ```
+
+- ✅ Trend summaries:
+    - Always sort ascending by time period.
+    - Use ROUND() if needed for readability.
+    - Output must show periods and USD-normalized totals.
+    - If the user asks “which period was higher,” compute both totals and return comparison text in summary (e.g., “2025 had higher total spend than 2024”).
 
 -- Duration & Average Time Calculations
 When a user asks about:
@@ -721,11 +810,11 @@ The report covers rolling windows relative to CURRENT_DATE.
         WHERE a.workflow_id = w.workflow_id
           AND LOWER(a.status) = 'approved'
           AND (
-            LOWER(ra.user_name) ILIKE '%beverly dale%'
+            LOWER(ra.user_name) ILIKE '%matthew bradley%'
             OR LOWER(ra.user_name) ILIKE '%karen lo%'
             OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
             OR LOWER(ra.user_name) ILIKE '%pat higgins%'
-            OR LOWER(ra.email) ILIKE '%beverly%'
+            OR LOWER(ra.email) ILIKE '%matthew%'
             OR LOWER(ra.email) ILIKE '%karen%'
             OR LOWER(ra.email) ILIKE '%stephanie%'
             OR LOWER(ra.email) ILIKE '%higgins%'
@@ -743,11 +832,11 @@ The report covers rolling windows relative to CURRENT_DATE.
       AND a.start_time < CURRENT_DATE
       AND LOWER(w.status) IN ('active','completed')
       AND (
-        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        LOWER(ra.user_name) ILIKE '%matthew bradley%'
         OR LOWER(ra.user_name) ILIKE '%karen lo%'
         OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
         OR LOWER(ra.user_name) ILIKE '%pat higgins%'
-        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%matthew%'
         OR LOWER(ra.email) ILIKE '%karen%'
         OR LOWER(ra.email) ILIKE '%stephanie%'
         OR LOWER(ra.email) ILIKE '%higgins%'
@@ -791,11 +880,11 @@ The report covers rolling windows relative to CURRENT_DATE.
       AND w.execution_date < CURRENT_DATE
       AND LOWER(a.status) = 'approved'
       AND (
-        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        LOWER(ra.user_name) ILIKE '%matthew bradley%'
         OR LOWER(ra.user_name) ILIKE '%karen lo%'
         OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
         OR LOWER(ra.user_name) ILIKE '%pat higgins%'
-        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%matthew%'
         OR LOWER(ra.email) ILIKE '%karen%'
         OR LOWER(ra.email) ILIKE '%stephanie%'
         OR LOWER(ra.email) ILIKE '%higgins%'
@@ -813,11 +902,11 @@ The report covers rolling windows relative to CURRENT_DATE.
       AND a.start_time < CURRENT_DATE
       AND LOWER(w.status) IN ('active','completed')
       AND (
-        LOWER(ra.user_name) ILIKE '%beverly dale%'
+        LOWER(ra.user_name) ILIKE '%matthew bradley%'
         OR LOWER(ra.user_name) ILIKE '%karen lo%'
         OR LOWER(ra.user_name) ILIKE '%stephanie haycox%'
         OR LOWER(ra.user_name) ILIKE '%pat higgins%'
-        OR LOWER(ra.email) ILIKE '%beverly%'
+        OR LOWER(ra.email) ILIKE '%matthew%'
         OR LOWER(ra.email) ILIKE '%karen%'
         OR LOWER(ra.email) ILIKE '%stephanie%'
         OR LOWER(ra.email) ILIKE '%higgins%'
