@@ -45,9 +45,12 @@ EMBED_MODEL = os.getenv("EMBED_MODEL","text-embedding-3-small")
 def embed_query(text:str)->List[float]:
     out = client.embeddings.create(model=EMBED_MODEL,input=text)
     return out.data[0].embedding
+    
+def vector_literal(vec: List[float]) -> str:
+    # Return ONLY the bracketed vector. Psycopg2 will add the single quotes;
+    # the SQL itself will add the ::vector cast.
+    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
-def vector_literal(vec:List[float])->str:
-    return "'[" + ",".join(f"{x:.6f}" for x in vec) + "]'::vector"
 
 # =========================================================
 # SQL generation & validation
@@ -464,7 +467,7 @@ You are an intent classifier for a legal contracts assistant. Your job is to cla
 
 Always return STRICT JSON in this format:
 {
-  "intent": "text_mention_count | text_snippets | summarize_contract | compare_contracts | semantic_find | similar_to_contract | weekly_report | sql_generic",
+  "intent": "text_mention_count | text_snippets | summarize_contract | compare_contracts | semantic_find | similar_to_contract | weekly_report | sql_generic | rag_text_qa",
   "terms": [string],                     # any keywords to match on (if applicable)
   "logic": {"operator":"AND|OR","exclude":[string]},
   "near": {"enabled":true|false,"window":120},
@@ -568,6 +571,34 @@ Use when the user is describing a **concept** they want to find, not a specific 
 
 ---
 
+### 🔹 rag_text_qa
+Broad natural-language questions that require reading or interpreting contract text,
+not just metadata or phrase matching.
+
+Use this when the user asks about the *content* or *meaning* of clauses,
+sections, or terms — even if they don’t quote words or use “snippet”.
+
+**Trigger examples, not limited to these, use these as a guide and interpret the question to see if it is a RAG text question:**
+- “what does IC-6420 say about termination?”
+- “explain the confidentiality clause in this agreement”
+- “what does the contract say about payment terms?”
+- “how is governing law handled?”
+- “does this mention how many hours the vendor works?”
+- “what does it say about subcontractors?”
+- “how does this define intellectual property?”
+- “where does it describe indemnification?”
+- “show me the language covering warranties”
+- “tell me what the MSAs say about data privacy”
+- “how are service levels described?”
+
+**Key difference:**  
+If the question requires *interpreting* or *retrieving text language*,
+rather than counting or filtering by metadata, it is `rag_text_qa`.
+
+Scope can be a single contract (e.g., “IC-6927”) or many (e.g., “our NDAs”);
+the system will decide dynamically.
+
+---
 ### 🔹 weekly_report  
 User explicitly requests the **full Legal & Contract Weekly Report** — a structured summary of multiple metrics (the 11-section bundle).
 
@@ -851,6 +882,91 @@ def answer_question(
                 "primary_response": new_primary
             }
 
+    # ===========================================
+    # Unified RAG text QA (broad question understanding)
+    # ===========================================
+    if intent["intent"] == "rag_text_qa":
+        # --- Detect single vs multi-contract scope ---
+        readable_ids = intent.get("readable_ids") or (primary_response or {}).get("example_ids") or []
+        is_single_contract = len(readable_ids) == 1
+        rid = readable_ids[0] if is_single_contract else None
+
+        qvec = embed_query(resolved_q)
+
+        if is_single_contract:
+            # single-contract: narrow to one doc
+            sql = """
+                SELECT readable_id, chunk_id, chunk_text,
+                       (embedding <=> %s::vector) AS distance
+                FROM ic.contract_chunks
+                WHERE readable_id = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT 24
+            """
+            cols, rows = run_sql(sql, (vector_literal(qvec), rid, vector_literal(qvec)))
+        else:
+            # multi-contract: search corpus
+            sql = """
+                SELECT readable_id, chunk_id, chunk_text,
+                       (embedding <=> %s::vector) AS distance
+                FROM ic.contract_chunks
+                ORDER BY embedding <=> %s::vector
+                LIMIT 40
+            """
+            cols, rows = run_sql(sql, (vector_literal(qvec), vector_literal(qvec)))
+
+        # --- Prepare prompt dynamically ---
+        if is_single_contract:
+            system_prompt = (
+                f"You are a legal contracts analyst. Answer only from the provided text chunks of contract {rid}. "
+                "Cite exact phrases using (IC-#### #chunk_id). If the answer is unclear or not found, say so."
+            )
+        else:
+            system_prompt = (
+                "You are a legal contracts analyst. Synthesize insights from multiple contracts. "
+                "Use only the retrieved text chunks. Group related findings and cite each with (IC-#### #chunk_id). "
+                "Never speculate beyond the text."
+            )
+
+        payload = {
+            "question": resolved_q,
+            "chunks": [
+                {"readable_id": r[0], "chunk_id": r[1], "text": r[2]}
+                for r in rows
+            ],
+            "row_count": len(rows)
+        }
+
+        stream = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            stream=True,
+        )
+
+        new_primary = {
+            "type": "text",
+            "value": f"RAG answer for {'contract ' + rid if is_single_contract else 'multiple contracts'}",
+            "context": rid or "corpus",
+            "example_ids": [r[0] for r in rows[:5]]  # store top docs for follow-ups
+        }
+
+        return {
+            "sql": sql,
+            "columns": cols,
+            "rows": safe_json(rows),
+            "stream": (chunk.choices[0].delta.content
+                       for chunk in stream
+                       if chunk.choices and chunk.choices[0].delta.content),
+            "intent_json": intent,
+            "conversation_summary": updated_summary,
+            "scope": scope,
+            "resolved_question": resolved_q,
+            "primary_response": new_primary,
+        }
 
     # ===========================================
     # Text mention count (keyword Boolean)
