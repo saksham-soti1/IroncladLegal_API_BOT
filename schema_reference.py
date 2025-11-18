@@ -21,7 +21,7 @@ Table: workflows
 
   ✅ Completion logic pattern:
       • For normal Ironclad workflows:
-          use COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          use COALESCE(w.execution_date, w.last_updated_at)
       • For imported contracts (attributes ? 'importId'):
           only include those with a true executed date, e.g. w.execution_date.
 
@@ -33,7 +33,7 @@ Table: workflows
           w.attributes,
           CASE
             WHEN w.attributes ? 'importId' THEN w.execution_date
-            ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+            ELSE COALESCE(w.execution_date, w.last_updated_at)
           END AS completion_ts
         FROM ic.workflows w
       )
@@ -51,6 +51,8 @@ Table: workflows
       and still uses last_updated_at for native workflows where execution_date may be null.
 
   ❌ Do not filter by 'In Progress' (not a stored value)
+  ✅ Note: 'in_progress' exists only in ic.step_states.state (step-level); workflow status uses 'active'/'completed'.
+
 
 - step (TEXT)  -- only present for in-progress
   ✅ Allowed values (case-sensitive): 'Create', 'Review', 'Sign', 'Archive'
@@ -158,6 +160,32 @@ DEPARTMENT LOGIC:
     - “contract owner”, “contract owner name”, “contract owner email” → use w.attributes->>'ownerName' and w.attributes->>'requesterEmail'
 
 - paper_source (TEXT)
+  ✅ Indicates whether the contract was initiated on Ironclad paper ("Our paper") 
+     or on the counterparty's paper ("Counterparty paper").
+  ✅ Stored as ic.workflows.paper_source (TEXT).
+  ✅ Many workflows have a NULL value because the paper source was never specified 
+     in Ironclad. Always exclude NULLs when aggregating or counting UNLESS they ask for a full breakdown of contract count by paper source:
+        WHERE paper_source IS NOT NULL
+  ✅ When describing results, you may note that some contracts lack this field 
+     because it was not entered in Ironclad.
+
+- current_turn_party (TEXT)
+  ✅ Indicates whose turn it currently is in the workflow process.
+  ✅ Stored in the JSON attributes field as: attributes->>'currentTurnParty'.
+  ✅ Typical values include:
+       • 'counterparty'   → It is the counterparty’s turn to review or act.
+       • 'internal'       → It is Vaxcyte’s (our) turn.
+       • 'turn tracking complete' → The workflow’s review turns are finished.
+  ✅ Only meaningful when w.status = 'active' (in-progress workflows).
+  ✅ When counting or filtering, always use LOWER(attributes->>'currentTurnParty') and group by it as a text key.
+  ✅ Example query pattern:
+      SELECT LOWER(w.attributes->>'currentTurnParty') AS current_turn_party,
+             COUNT(*) AS workflows
+      FROM ic.workflows w
+      WHERE w.status = 'active'
+      GROUP BY 1
+      ORDER BY workflows DESC;
+
 - document_type (TEXT)          -- not the contract type category
 - agreement_date (TIMESTAMPTZ)
 - execution_date (TIMESTAMPTZ)  -- use for executed/signed filters and year breakdowns
@@ -194,15 +222,22 @@ Approvals (ic.approval_requests):
     • Supports partial names (first name, last name, or email).
 - Always normalize with LOWER(a.status).
 
-Status values:
+Status values (history records):
 - Approved approvals:
     • LOWER(a.status)='approved'
     • Always filter with a.end_time (the approval decision time).
-- Pending approvals:
-    • LOWER(a.status)='pending' AND a.end_time IS NULL
-    • Always require w.status='active' (pending approvals are only valid in in-progress workflows).
+- Pending approvals (history view, person/role-specific only):
+    • Use approval_requests only when the user names a person or role (who has a pending task).
+    • For generic “how many are pending approval?” counts, do NOT use approval_requests. Use ic.step_states instead (see Step-state logic).
 - Approver reassigned:
     • LOWER(a.status) LIKE 'approver reassigned%'.
+
+Routing rule:
+- All “pending approval/signature” counts (generic or person-specific) → ic.step_states (authoritative current state).
+- For person-specific pending, ALSO require role matches in ic.role_assignees:
+    • approvals → LOWER(ra.role_id) LIKE '%approver%'
+    • signatures → LOWER(ra.role_id) LIKE '%signer%'
+- Use ic.approval_requests only for history/decisions (approved dates, reassigned), not for current pending counts.
 
 Time windows (always anchor to CURRENT_DATE):
 - Month:
@@ -233,10 +268,14 @@ Time windows (always anchor to CURRENT_DATE):
     • Use "last 7 days" logic only if the user says: “past 7 days”, “last 7 days”, “in the last week”.
   - If the user does NOT specify a timeframe, do not apply a date filter.
 
+
 Workflow scope:
 - If user says “in progress” → add w.status='active'.
 - If user says “completed” → add w.status='completed'.
-- If user says “pending approval” → always require w.status='active'.
+- “Pending approval” → ic.step_states (step_name='approvals', state='in_progress') + w.status='active'.
+    • If a person/role is named → ALSO require ic.role_assignees with LOWER(role_id) LIKE '%approver%'.
+- “Pending signature” → ic.step_states (step_name='signatures', state='in_progress') + w.status='active'.
+    • If a person/role is named → ALSO require ic.role_assignees with LOWER(role_id) LIKE '%signer%'.
 - If no state specified → include all.
 
 Role-based queries:
@@ -244,65 +283,89 @@ Role-based queries:
 
 Examples:
 
--- Approvals by Jane Doe all time
+-- ✅ Approvals by Jane Doe (all time)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
+JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+WHERE LOWER(a.status) = 'approved'
   AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%');
 
--- Approvals by Jane Doe this month
+-- ✅ Approvals by Jane Doe (this month)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
+JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+WHERE LOWER(a.status) = 'approved'
   AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
   AND a.end_time >= date_trunc('month', CURRENT_DATE)
   AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month';
 
--- Approvals by Jane Doe last 3 months (rolling window)
+-- ✅ Approvals by Jane Doe (last 3 months)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id=a.workflow_id AND ra.role_id=a.role_id
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
+JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+WHERE LOWER(a.status) = 'approved'
   AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
   AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
   AND a.end_time < CURRENT_DATE;
 
--- Pending approvals for Stephanie/Use logic for anyone else (in-progress workflows only)
-SELECT COUNT(DISTINCT a.workflow_id) AS pending_workflows
-FROM ic.approval_requests a
-JOIN ic.role_assignees ra 
-  ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-JOIN ic.workflows w 
-  ON w.workflow_id = a.workflow_id
-WHERE LOWER(a.status) = 'pending'
-  AND a.end_time IS NULL
+-- ✅ Generic pending approvals (current state, not history)
+SELECT COUNT(*) AS pending_approvals
+FROM ic.step_states s
+JOIN ic.workflows w ON w.workflow_id = s.workflow_id
+WHERE s.step_name = 'approvals'
+  AND LOWER(s.state) = 'in_progress'
+  AND w.status = 'active';
+
+-- ✅ Generic pending signatures (current state, not history)
+SELECT COUNT(*) AS pending_signatures
+FROM ic.step_states s
+JOIN ic.workflows w ON w.workflow_id = s.workflow_id
+WHERE s.step_name = 'signatures'
+  AND LOWER(s.state) = 'in_progress'
+  AND w.status = 'active';
+
+-- ✅ Person-specific pending approvals (requires approver role + in_progress)
+SELECT COUNT(*) AS pending_for_person
+FROM ic.step_states s
+JOIN ic.workflows w       ON w.workflow_id = s.workflow_id
+JOIN ic.role_assignees ra ON ra.workflow_id = s.workflow_id
+WHERE s.step_name = 'approvals'
+  AND LOWER(s.state) = 'in_progress'
   AND w.status = 'active'
+  AND LOWER(ra.role_id) LIKE '%approver%'
   AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
 
--- Roles by approval count (this year)
+-- ✅ Person-specific pending signatures (requires signer role + in_progress)
+SELECT COUNT(*) AS pending_signatures_for_person
+FROM ic.step_states s
+JOIN ic.workflows w       ON w.workflow_id = s.workflow_id
+JOIN ic.role_assignees ra ON ra.workflow_id = s.workflow_id
+WHERE s.step_name = 'signatures'
+  AND LOWER(s.state) = 'in_progress'
+  AND w.status = 'active'
+  AND LOWER(ra.role_id) LIKE '%signer%'
+  AND (LOWER(ra.user_name) ILIKE '%angela%' OR LOWER(ra.email) ILIKE '%angela%');
+
+-- ✅ Roles by approval count (this year, from approval history)
 SELECT a.role_name, COUNT(DISTINCT a.workflow_id) AS approvals
 FROM ic.approval_requests a
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
-WHERE LOWER(a.status)='approved'
+JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+WHERE LOWER(a.status) = 'approved'
   AND a.end_time >= date_trunc('year', CURRENT_DATE)
   AND a.end_time <  date_trunc('year', CURRENT_DATE) + INTERVAL '1 year'
 GROUP BY a.role_name
 ORDER BY approvals DESC;
 
--- Approver reassigned events by role
+-- ✅ Approver reassigned events by role (historical tracking)
 SELECT a.role_name, COUNT(*) AS reassigned
 FROM ic.approval_requests a
-JOIN ic.workflows w ON w.workflow_id=a.workflow_id
+JOIN ic.workflows w ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) LIKE 'approver reassigned%'
 GROUP BY a.role_name
 ORDER BY reassigned DESC;
-
-
 
 
 Quarter logic (calendar-aligned):
@@ -337,7 +400,7 @@ Financial rules
 - Always SUM (w.contract_value_amount * COALESCE(r.rate_to_usd, 1.0)) as the USD total.
 - When filtering for executed/signed, use (w.status='completed' OR w.attributes ? 'importId') 
   but apply the unified completion logic for time windows (see status section).
-  For spend or contract value analysis, use COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+  For spend or contract value analysis, use COALESCE(w.execution_date, w.last_updated_at)
   for native workflows, and w.execution_date for imported ones only if execution_date is not null.
 
 - Never SUM raw w.contract_value_amount across mixed currencies unless the user explicitly says “don’t convert”.
@@ -417,7 +480,7 @@ Spend trend and time comparisons:
   ✅ Completion timestamp rule:
       CASE
         WHEN w.attributes ? 'importId' THEN w.execution_date
-        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        ELSE COALESCE(w.execution_date, w.last_updated_at)
       END
 
 - Always include both conditions for executed contracts:
@@ -439,7 +502,7 @@ Spend trend and time comparisons:
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts
       FROM ic.workflows w
     )
@@ -461,7 +524,7 @@ Spend trend and time comparisons:
       SELECT
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts,
         w.contract_value_amount,
         w.contract_value_currency
@@ -572,7 +635,7 @@ always compute the difference between creation and completion using the unified 
 ✅ Unified completion timestamp rule:
     CASE
       WHEN w.attributes ? 'importId' THEN w.execution_date
-      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      ELSE COALESCE(w.execution_date, w.last_updated_at)
     END AS completion_ts
 
 ✅ Calculation rules:
@@ -582,8 +645,8 @@ always compute the difference between creation and completion using the unified 
 - When grouping by department, normalize department names via ic.department_map and ic.department_canonical.
 - Exclude departments with NULL or invalid average values when ranking.
 - When grouping by department (or joining to department tables), the CTE must SELECT w.department and w.owner_name.
-- Never use COALESCE(w.execution_date, w.last_updated_at) without w.workflow_completed_at; always use
-  COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at) in both SELECT and WHERE.
+- Always use COALESCE(w.execution_date, w.last_updated_at) consistently in both SELECT and WHERE clauses.
+
 
 -- ✅ Example (average number of days to complete per department)
 WITH wf AS (
@@ -595,14 +658,14 @@ WITH wf AS (
     w.created_at,
     CASE
       WHEN w.attributes ? 'importId' THEN w.execution_date
-      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      ELSE COALESCE(w.execution_date, w.last_updated_at)
     END AS completion_ts
   FROM ic.workflows w
   WHERE (w.status = 'completed' OR w.attributes ? 'importId')
     AND (
       CASE
         WHEN w.attributes ? 'importId' THEN w.execution_date
-        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        ELSE COALESCE(w.execution_date, w.last_updated_at)
       END
     ) IS NOT NULL
 )
@@ -641,14 +704,14 @@ WITH wf AS (
     w.created_at,
     CASE
       WHEN w.attributes ? 'importId' THEN w.execution_date
-      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      ELSE COALESCE(w.execution_date, w.last_updated_at)
     END AS completion_ts
   FROM ic.workflows w
   WHERE (w.status = 'completed' OR w.attributes ? 'importId')
     AND (
       CASE
         WHEN w.attributes ? 'importId' THEN w.execution_date
-        ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+        ELSE COALESCE(w.execution_date, w.last_updated_at)
       END
     ) IS NOT NULL
 )
@@ -690,7 +753,7 @@ Completion timestamp logic:
 - completion_ts rule:
     CASE
       WHEN w.attributes ? 'importId' THEN w.execution_date
-      ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+      ELSE COALESCE(w.execution_date, w.last_updated_at)
     END
 
 - Example query:
@@ -700,7 +763,7 @@ Completion timestamp logic:
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts
       FROM ic.workflows w
     )
@@ -802,6 +865,80 @@ Table: role_assignees
 - user_id (TEXT)
 - user_name (TEXT)
 - email (TEXT)
+
+Signer logic:
+- Signers are identified in ic.role_assignees where the role_id contains the substring 'signer' (case-insensitive).
+- These entries represent Vaxcyte signers who execute contracts.
+- Use ra.user_name (display name) and ra.email for signer identification.
+- When counting or filtering by signer, always add a condition like:
+    WHERE LOWER(ra.role_id) LIKE '%signer%'
+- Example queries:
+    -- Most frequent signer overall
+    SELECT ra.user_name AS signer_name, COUNT(*) AS contract_sign_count
+    FROM ic.role_assignees ra
+    JOIN ic.workflows w ON w.workflow_id = ra.workflow_id
+    WHERE LOWER(ra.role_id) LIKE '%signer%'
+    GROUP BY ra.user_name
+    ORDER BY contract_sign_count DESC;
+
+    -- Signer for a specific contract
+    SELECT ra.user_name AS signer_name, ra.email
+    FROM ic.role_assignees ra
+    JOIN ic.workflows w ON w.workflow_id = ra.workflow_id
+    WHERE w.readable_id = '<IC-####>'
+      AND LOWER(ra.role_id) LIKE '%signer%';
+- When a user asks “who is the signer”, “most frequent signer”, or “signer for IC-####”, the assistant should reference ic.role_assignees and filter by role_id LIKE '%signer%'.
+
+Approver logic:
+- Approvers are identified in ic.role_assignees where the role_id contains the substring 'approver' (case-insensitive).
+- Use ra.user_name and ra.email for approver identification.
+- When counting or filtering pending approvals for a person, you MUST combine:
+    1) ic.step_states s (step_name='approvals', state='in_progress')  ← current step status
+    2) ic.role_assignees ra with LOWER(ra.role_id) LIKE '%approver%'   ← person holds approver role
+
+Table: step_states
+- workflow_id (TEXT, FK → workflows)
+- step_name (TEXT)   -- e.g., 'approvals', 'signatures'
+- state (TEXT)       -- e.g., 'not_started', 'in_progress', 'completed'
+
+Step-state logic:
+- Tracks the current progress state of major workflow steps like approvals and signatures.
+- This table replaces ic.approval_requests for counting or filtering by approval/signature progress.
+- Typical meanings:
+    • approvals + not_started → workflow has not entered approvals yet (still in setup or review)
+    • approvals + in_progress → workflow is currently in approval stage (pending approval)
+    • approvals + completed   → approval stage finished
+    • signatures + not_started → approval completed, signing not yet begun
+    • signatures + in_progress → workflow is currently in signing stage (pending signature)
+    • signatures + completed   → fully signed and finished
+- Interpretation rules:
+    • “Pending approval” → step_name='approvals' AND state='in_progress'
+    • “Pending signature” or “awaiting signature” → step_name='signatures' AND state='in_progress'
+    • “Fully signed” or “completed signatures” → step_name='signatures' AND state='completed'
+    • “Approvals not started” or “before approval stage” → step_name='approvals' AND state='not_started' (not counted as pending)
+- Always use LOWER(state) when filtering.
+- Example query patterns:
+    -- Workflows currently in approval stage
+    SELECT COUNT(*) AS pending_approvals
+    FROM ic.step_states
+    WHERE step_name = 'approvals'
+      AND LOWER(state) = 'in_progress';
+
+    -- Workflows currently in signing stage
+    SELECT COUNT(*) AS pending_signatures
+    FROM ic.step_states
+    WHERE step_name = 'signatures'
+      AND LOWER(state) = 'in_progress';
+
+    -- Fully signed workflows
+    SELECT COUNT(*) AS signed_contracts
+    FROM ic.step_states
+    WHERE step_name = 'signatures'
+      AND LOWER(state) = 'completed';
+
+- When users ask about pending approvals or signatures, always query ic.step_states instead of ic.approval_requests.
+- If the user adds filters (e.g., department, record type, legal entity), join back to ic.workflows:
+    JOIN ic.workflows w ON w.workflow_id = s.workflow_id
 
 Table: participants
 - workflow_id (TEXT, FK → workflows)
@@ -1023,7 +1160,7 @@ The report covers rolling windows relative to CURRENT_DATE.
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts
       FROM ic.workflows w
     )
@@ -1108,7 +1245,7 @@ The report covers rolling windows relative to CURRENT_DATE.
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts
       FROM ic.workflows w
     )
@@ -1176,7 +1313,7 @@ The report covers rolling windows relative to CURRENT_DATE.
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts
       FROM ic.workflows w
     )
@@ -1203,7 +1340,7 @@ The report covers rolling windows relative to CURRENT_DATE.
         w.attributes,
         CASE
           WHEN w.attributes ? 'importId' THEN w.execution_date
-          ELSE COALESCE(w.execution_date, w.workflow_completed_at, w.last_updated_at)
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
         END AS completion_ts,
         w.contract_value_amount,
         w.contract_value_currency
