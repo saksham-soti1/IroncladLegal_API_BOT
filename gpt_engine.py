@@ -45,7 +45,7 @@ EMBED_MODEL = os.getenv("EMBED_MODEL","text-embedding-3-small")
 def embed_query(text:str)->List[float]:
     out = client.embeddings.create(model=EMBED_MODEL,input=text)
     return out.data[0].embedding
-    
+
 def vector_literal(vec: List[float]) -> str:
     # Return ONLY the bracketed vector. Psycopg2 will add the single quotes;
     # the SQL itself will add the ::vector cast.
@@ -173,31 +173,43 @@ def build_summarizer_prompt() -> str:
         "• Keep grammar clear; never change numeric values.\n"
         "• Finish with one concise overall summary; do not invent facts.\n"
     )
-
 def build_general_summarizer_prompt() -> str:
     """
     Exec Brief default for single-query answers.
-    Will optionally lead with prior 'primary_response' context when provided.
+    Strongly prefers the CURRENT resolved_question; prior context may guide scoping,
+    but must never override the current question.
     """
     return (
         "You are a precise, executive-brief legal contracts analyst.\n"
-        "You will receive a JSON payload with SQL results (columns, rows), the resolved question, "
-        "and an optional prior primary_response.\n\n"
-        "Write a crisp 1–2 sentence answer (no bullets) that is fully grounded in the payload.\n\n"
-        "RULES:\n"
+        "You will receive a JSON payload that ALWAYS includes:\n"
+        "  - 'columns' and 'rows' (SQL results preview)\n"
+        "  - 'resolved_question' (the CURRENT turn's fully self-contained question)\n"
+        "  - optional 'primary_response' (from a prior turn; may be numeric or grouped)\n"
+        "  - optional 'scope' and 'relevant_history' (helpful context only)\n\n"
+        "Write a crisp 1–2 sentence answer (no bullets) fully grounded in the payload.\n\n"
+        "HARD RULES:\n"
         "- Use ONLY data from the payload; do not invent values.\n"
-        "- If 'true_numeric_result' exists, that is authoritative.\n"
-        "- If 'primary_response' is present AND it contains a numeric value, AND this turn is a follow-up, then:\n"
-        "    - Lead with a clause like 'Of the {primary_response.value} {primary_response.context}, ...'\n"
-        "    - If the value is not numeric, do NOT use it to summarize the follow-up.\n"
-        "- If grouping columns exist (e.g., departments, reviewers) and one numeric column appears in all rows, "
-        "assume it represents row-level counts. If the question asks for a total, sum that column across rows. Ensure that the total is correct, never make up a total. Count precisely\n"
+        "- ALWAYS interpret and answer the CURRENT 'resolved_question'.\n"
+        "- Prior context ('primary_response', 'relevant_history', 'scope') can refine scoping\n"
+        "  IF it is consistent with the CURRENT question; if there is any conflict, ignore the prior context.\n"
+        "- If 'true_numeric_result' exists, that number is authoritative for totals.\n"
+        "- If this turn is a follow-up AND 'primary_response' is provided:\n"
+        "    • If primary_response.type == 'numeric': You MAY lead with\n"
+        "      'Of the {primary_response.value} {primary_response.context}, ...' when the current question\n"
+        "      is clearly a subset or breakdown of that number.\n"
+        "    • If primary_response.type == 'grouped': Treat the group's labels as categories that follow-ups\n"
+        "      may refer to (e.g., 'counterparties', 'internal'). If the CURRENT question mentions one of those\n"
+        "      labels, treat it as a subset and answer accordingly. Do NOT assume a subset when the label\n"
+        "      is not mentioned in the CURRENT question.\n"
+        "- If grouping columns exist and one numeric column appears in all rows, assume it represents row-level counts.\n"
+        "  If the question asks for a total, sum that column exactly — never guess.\n"
         "- If the result has only 1 row, report its value directly.\n"
-        "- Format money with $ and commas when present.\n"
+        "- Format money with $ and commas.\n"
         "- If zero rows, say 'No matching results were found, meaning no data was found for the given filters.'\n"
         "- Keep to 1–2 sentences; no SQL, no tables.\n"
-
     )
+
+
 
 def build_contract_summarizer_prompt() -> str:
     return (
@@ -295,43 +307,47 @@ INPUTS:
 
 GOAL:
 - Resolve whether this is a follow-up or a new topic.
-- If it is a follow-up, inherit any relevant filters from the current scope, unless explicitly overridden.
-- If it is a new topic, do not inherit anything; reset filters as needed.
+- If it is a follow-up, inherit any relevant filters or labels from the current scope, unless explicitly overridden.
+- If it is a new topic, start fresh (reset irrelevant filters).
 
 RULES:
 
 -- FOLLOW-UP DETECTION --
 
-- You MUST mark is_followup = true if the user relies on prior scope or context in any of the following ways:
-    • Uses vague or referential language: "those", "that", "how many of those", "what about", "break that down", "split by", "and how many", "same filters"
-    • Asks for a breakdown of something just counted: e.g., "by department", "by type", "by vendor", "split by priority"
-    • Adds additional filters to the prior scope: e.g., "and how many were MSAs", "only the ones with high priority", "from Clinical"
-    • Asks to compare or further filter results from the last query
-    • Refers to a specific number or label mentioned earlier (e.g., "of the 31...", "those with Stephanie's approval", etc.)
+- You MUST mark is_followup = true only when the new message clearly depends on or refers back to the prior result, including:
+    • Referential language: "those", "these", "that", "them", "of the ones", "what about", "and how many of those"
+    • Incremental filters: "only high priority", "just legal", "by department", "from counterparties"
+    • Comparative or continuation phrasing: "and how about", "now show me", "what about the rest"
+    • Mentions or uses of a label (like "counterparties", "internal", "IT", "NDAs") that appeared in relevant_history **only when** the phrasing implies subset or continuation — not when the question stands alone.
+      (e.g., “of the ones from counterparties” → follow-up; “how many counterparty contracts exist overall” → new topic)
+    • Requests for further filtering, breakdown, or listing of a previous result (“list them”, “show which ones”)
+    • Questions that reference a number, timeframe, or condition from a previous answer
 
 - You MUST mark is_followup = false if:
-    • The user changes the subject entirely (e.g., from executed → imported, or contracts → spend)
-    • The user introduces a completely new timeframe, vendor, or entity that shifts focus away from the previous query
-    • The new question can be interpreted cleanly without prior context and has no dependency on previous scope
+    • The user starts a new analytical topic or timeframe
+    • The message can be understood completely without previous context
+    • The user reuses terms like “counterparties” or “vendors” generically, not as continuation (“how many counterparty contracts do we have this year” = new topic)
 
 -- SCOPE INHERITANCE --
 
 - If follow-up = true:
-    • Automatically inherit any active filters from the previous scope, unless they are explicitly overridden
-    • Always keep filters like: status, timeframe, vendor, department, record_type, approver, step, priority
-    • If the user changes one of those (e.g., “Q1” instead of “this year”), update scope_updates with the new value and include the old key in reset_keys
+    • Inherit filters from prior scope unless overridden
+    • Add any clearly implied label from relevant_history (e.g., "counterparty", "IT department") only when phrasing suggests “those” or a subset
+    • Keep keys: status, timeframe, vendor, department, record_type, approver, step, priority
 
 -- SCOPE RESETTING --
 
 - If follow-up = false:
     • Do not inherit filters from the prior scope
-    • Set reset_keys to remove any now-irrelevant filters (e.g., timeframe, vendor, department, step)
-    • Only keep what the user explicitly says
+    • Reset unrelated filters (e.g., timeframe, vendor, department, step)
 
 -- RESOLVED QUESTION QUALITY --
 
-- The resolved_question must be a fully stand-alone version of the user’s message, clearly specifying all filters, even if inherited
-- Do not use vague pronouns like “those” or “them” — rewrite into exact, clear scope
+- resolved_question must be a clear, standalone question explicitly listing filters and context
+- Rewrite vague pronouns into explicit forms when follow-up = true
+- Example:
+      user_text: "and how many of those were MSAs?"
+      resolved_question: "How many MSA contracts were completed this quarter?"
 
 OUTPUT STRICT JSON ONLY:
 {
@@ -343,8 +359,6 @@ OUTPUT STRICT JSON ONLY:
   "notes": "brief rationale explaining why this is or isn't a follow-up"
 }
 """
-
-
 
 def history_selector(prior_summary: Optional[str],
                      prior_scope: Optional[Dict[str,Any]],
@@ -792,9 +806,31 @@ def answer_question(
     """
     scope = dict(scope or {})
     # -- (1) History selector: compress prior context into focused bullets + updated summary
+    # Enrich relevant_history with grouped labels from the last primary_response (if any)
+    extra_labels = []
+    if primary_response and isinstance(primary_response, dict):
+        if primary_response.get("type") == "grouped":
+            extra_labels = [lbl.lower() for lbl in primary_response.get("labels", []) if lbl]
+    scope.setdefault("relevant_history", [])
+    if extra_labels:
+        # merge labels into history so the rewriter can see them as contextual keywords
+        merged = list(dict.fromkeys(scope["relevant_history"] + extra_labels))
+        scope["relevant_history"] = merged[-20:]
+
+    # -- (1) History selector: compress prior context into focused bullets + updated summary
+    # Merge new bullets with old to persist memory beyond one turn
     hs = history_selector(conversation_summary, scope, resolved_question, primary_response)
-    relevant_history = hs.get("relevant_history", [])
+    new_relevant = hs.get("relevant_history", [])
+    if conversation_summary and "relevant_history" in scope:
+        combined_history = list(dict.fromkeys(scope["relevant_history"] + new_relevant))
+    else:
+        combined_history = new_relevant
+    relevant_history = combined_history[-10:]  # keep the last 10 for clarity
     updated_summary = hs.get("updated_summary", conversation_summary)
+    # keep history persistent and capped for context longevity
+    existing_history = scope.get("relevant_history", [])
+    merged_history = list(dict.fromkeys(existing_history + relevant_history))
+    scope["relevant_history"] = merged_history[-20:]
 
     # -- (2) Follow-up detector + rewriter (preferred path)
     rew = followup_rewriter(
@@ -1003,6 +1039,8 @@ FROM matches"""
             "row_count_returned": len(rows),
             "true_numeric_result": numeric_value,
             "intent": intent,
+            "scope": scope,
+            "relevant_history": scope.get("relevant_history", []),
             "primary_response": primary_response if is_followup_turn else None
         }
         stream = stream_general_from_payload(payload)
@@ -1051,6 +1089,8 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "columns": cols,
             "rows_preview": safe_json(rows[:50]),
             "intent": intent,
+            "scope": scope,
+            "relevant_history": scope.get("relevant_history", []),
             "primary_response": primary_response if is_followup_turn else None
         }
         stream = stream_general_from_payload(payload)
@@ -1184,6 +1224,8 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "row_count_returned": len(rows),
             "true_numeric_result": numeric_value,
             "intent": intent,
+            "scope": scope,
+            "relevant_history": scope.get("relevant_history", []),
             "primary_response": primary_response if is_followup_turn else None
         }
         stream = client.chat.completions.create(
@@ -1196,16 +1238,48 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             stream=True,
         )
 
-        # ✅ Only save primary_response if there's a true numeric result (for follow-ups)
+               # ✅ Build next-turn anchor for follow-ups
+        new_primary = None
+
         if numeric_value is not None:
+            # simple scalar result (e.g., “106”)
             new_primary = {
                 "type": "numeric",
                 "value": numeric_value,
                 "context": resolved_q
             }
         else:
-            new_primary = None  # don't store grouped row counts like "21 rows"
+            # detect a simple grouped result: one text-like column + one numeric-like column
+            # this lets us remember category labels like "counterparties", "internal", etc.
+            try:
+                text_col_idx = None
+                for ci, cname in enumerate(cols):
+                    if any(isinstance(r[ci], str) and r[ci].strip() for r in rows if r is not None):
+                        text_col_idx = ci
+                        break
 
+                num_col_idx = None
+                for ci, cname in enumerate(cols):
+                    if any(isinstance(r[ci], (int, float, Decimal)) for r in rows if r is not None):
+                        num_col_idx = ci
+                        break
+
+                if text_col_idx is not None and num_col_idx is not None and text_col_idx != num_col_idx:
+                    labels = []
+                    for r in rows:
+                        v = r[text_col_idx]
+                        if isinstance(v, str) and v.strip():
+                            labels.append(v.strip())
+                    if labels:
+                        new_primary = {
+                            "type": "grouped",
+                            "context": resolved_q,
+                            "group_col": cols[text_col_idx],
+                            "value_col": cols[num_col_idx],
+                            "labels": [l.lower() for l in labels][:100]
+                        }
+            except Exception:
+                pass
 
         return {
             "sql": single_sql,
@@ -1221,7 +1295,6 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "scope": scope,
             "resolved_question": resolved_q,
             "primary_response": new_primary if new_primary else primary_response,
-
         }
 
     except Exception as e:
