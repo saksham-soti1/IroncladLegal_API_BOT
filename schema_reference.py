@@ -1,5 +1,89 @@
 SCHEMA_DESCRIPTION = """
 Database schema (schema = ic)
+SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
+
+- First, carefully interpret the user’s question in natural language.
+  • Identify what they are asking for: counts, lists, trends, or a specific contract.
+  • Identify any dimensions: time window, department, contract type, vendor/counterparty, owner, signer, approver, import vs native.
+  • Only then decide whether the answer should come from SQL (metadata/tables) or from text/embeddings.
+  - For ANY question where the user is asking about a specific PERSON’S
+  involvement in workflows (e.g., “how many workflows has <person> been
+  involved in / participated in / contributed to / been on / worked on”),
+  you should refer to the Person Involvement / Participation Logic section.
+
+  This trigger ONLY applies when:
+    • The name refers to an individual human person (first or full name),
+      NOT a department, vendor, counterparty, team, or role.
+      Examples of PERSON queries:
+        “How many workflows has Adam worked on?”
+        “Show workflows Karen participated in.”
+        “How many workflows was John part of last quarter?”
+      Non-person queries that MUST NOT trigger this:
+        “Which department was involved?”
+        “Was Finance part of this?”
+        “Was Legal involved?”
+        “Which vendors were involved?”
+        “Which counterparties participated?”
+
+  When a PERSON is identified, ALWAYS:
+    • Extract FIRST NAME only.
+    • Match across BOTH ic.participants and ic.role_assignees.
+    • Use UNION + COUNT(DISTINCT).
+    • Apply additional filters (department, date, contract type) AFTER
+      matching the person.
+
+
+- This schema is a HARD CONSTRAINT, not a suggestion.
+  • Do NOT invent tables, columns, or JSON keys that are not described below.
+  • If you are not sure a column exists, do NOT use it.
+  • Prefer patterns and examples shown in this schema over anything you “remember”.
+
+- CTE SAFETY RULE (for any CTE aliased as wf):
+  Whenever you write a CTE like:
+
+      WITH wf AS (
+        SELECT ...
+        FROM ic.workflows w
+        ...
+      )
+
+  You MUST include at least the following columns in the SELECT list:
+
+      w.workflow_id,
+      w.title,
+      w.record_type,
+      w.status,
+      w.attributes
+
+  Example baseline pattern (you can add more fields, but never drop these):
+
+      WITH wf AS (
+        SELECT
+          w.workflow_id,
+          w.title,
+          w.record_type,
+          w.status,
+          w.attributes,
+          ... other columns you need ...
+        FROM ic.workflows w
+        ... optional WHERE filters ...
+      )
+
+  - Never reference wf.title, wf.record_type, wf.status, or wf.attributes outside the CTE
+    unless they were selected in the CTE.
+  - Never reference any column from wf that you did not explicitly SELECT in the CTE.
+
+- Time logic and contract type logic MUST follow the rules below.
+  • For “completed/executed/finished” time windows, always use the unified completion_ts CASE pattern defined later.
+  • For “recently created / launched / most recent” workflows, always use the unified created_ts CASE pattern defined later.
+  • For contract types explicitly named by the user (NDA, MSA, SOW, etc.), ALWAYS use the ContractTypeMatch() rule defined below:
+        LOWER(w.record_type) = '<type>' OR LOWER(w.title) ILIKE '%<type>%'
+    and never try to guess other patterns.
+
+- If the user’s question cannot be answered with a single clean query, prefer:
+  • A small CTE + simple SELECT
+  • Or multiple simple queries with clear, safe WHERE clauses
+  over one huge, complex, error-prone query.
 
 -- Core workflow metadata (used by the GPT SQL path; do not invent columns)
 Table: workflows
@@ -29,6 +113,9 @@ Table: workflows
       ```sql
       WITH wf AS (
         SELECT
+          w.workflow_id,
+          w.title,
+          w.record_type,
           w.status,
           w.attributes,
           CASE
@@ -44,6 +131,8 @@ Table: workflows
         AND completion_ts IS NOT NULL
         AND completion_ts >= CURRENT_DATE - INTERVAL '30 days'
         AND completion_ts <  CURRENT_DATE;
+      ```
+
       ```
 
   ✅ Why:
@@ -842,7 +931,10 @@ LIMIT 5;
 WITH wf AS (
   SELECT
     w.workflow_id,
+    w.title,
+    w.record_type,
     w.status,
+    w.attributes,
     w.created_at,
     CASE
       WHEN w.attributes ? 'importId' THEN w.execution_date
@@ -862,6 +954,7 @@ SELECT
 FROM wf
 WHERE wf.created_at IS NOT NULL
   AND wf.completion_ts IS NOT NULL;
+
 
 ✅ Why:
 - Provides interval-based output (e.g., “42 days 12:00:00”).
@@ -956,6 +1049,82 @@ Recommended SQL patterns (metadata)
     FROM ic.workflows
     GROUP BY 1
     ORDER BY contracts DESC;
+
+
+-- Person Involvement / Participation Logic
+
+Used for questions like:
+- "how many workflows has <person> been involved in"
+- "which workflows did <person> contribute to"
+- "has <person> participated in any workflows"
+- "show workflows <person> was part of last quarter"
+- "how many workflows was <person> on in Finance"
+- "how many workflows did <person> work on this year"
+
+Person matching must ALWAYS check BOTH sources:
+1) ic.participants        (email only)
+2) ic.role_assignees      (user_name + email + role_id)
+
+Name matching rules:
+- Extract ONLY the FIRST NAME from the user query.
+  Example: "Adam Hundemann" → "adam"
+- Do NOT use last names for matching (email formats vary).
+- Case-insensitive match using ILIKE '%<first_name>%'.
+
+Participants filter:
+- LOWER(p.email) ILIKE '%adam%'
+
+Role-assignees filter:
+- LOWER(ra.user_name) ILIKE '%adam%'
+- OR LOWER(ra.email) ILIKE '%adam%'
+
+Unified involvement logic:
+A person is considered "involved" / "participating" / "contributing" if
+their FIRST NAME matches either participants or role_assignees.
+
+SQL pattern (base case):
+
+WITH p_matches AS (
+    SELECT DISTINCT p.workflow_id
+    FROM ic.participants p
+    WHERE LOWER(p.email) ILIKE '%<first_name>%'
+),
+ra_matches AS (
+    SELECT DISTINCT ra.workflow_id
+    FROM ic.role_assignees ra
+    WHERE LOWER(ra.user_name) ILIKE '%<first_name>%'
+       OR LOWER(ra.email) ILIKE '%<first_name>%'
+),
+person AS (
+    SELECT workflow_id FROM p_matches
+    UNION
+    SELECT workflow_id FROM ra_matches
+)
+SELECT COUNT(DISTINCT workflow_id)
+FROM person;
+
+Time filters (optional):
+- Apply AFTER joining person → workflows.
+- Use created_ts for creation questions.
+- Use completion_ts for completed/executed questions.
+
+Department filters (optional):
+- Apply AFTER joining person → workflows.
+- Use the normalized department logic (department_clean).
+
+Contract type filters (optional):
+- Apply ContractTypeMatch('<type>') AFTER person matching
+  ONLY when the user explicitly mentions a contract type.
+
+Notes:
+- Always use UNION (not UNION ALL) to avoid duplicates.
+- Always use COUNT(DISTINCT workflow_id).
+- Never match last names unless emails contain them.
+
+This logic applies to keywords:
+"involved", "participated", "on", "worked on", "contributed",
+"helped with", "part of", "engaged in", "took part in", etc.
+
 
 -- Vendor / Counterparty guidance
 Preferred filter order:
@@ -1338,6 +1507,8 @@ The report covers rolling windows relative to CURRENT_DATE.
     WITH wf AS (
       SELECT
         w.workflow_id,
+        w.title,
+        w.record_type,
         w.status,
         w.attributes,
         CASE
@@ -1423,6 +1594,8 @@ The report covers rolling windows relative to CURRENT_DATE.
     WITH wf AS (
       SELECT
         w.workflow_id,
+        w.title,
+        w.record_type,
         w.status,
         w.attributes,
         CASE
@@ -1491,6 +1664,8 @@ The report covers rolling windows relative to CURRENT_DATE.
     WITH wf AS (
       SELECT
         w.workflow_id,
+        w.title,
+        w.record_type,
         w.status,
         w.attributes,
         CASE
@@ -1518,6 +1693,8 @@ The report covers rolling windows relative to CURRENT_DATE.
     WITH wf AS (
       SELECT
         w.workflow_id,
+        w.title,
+        w.record_type,
         w.status,
         w.attributes,
         CASE
