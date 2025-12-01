@@ -66,11 +66,153 @@ Table: workflows
 - is_complete (BOOLEAN)
 - is_cancelled (BOOLEAN)
 
-- created_at (TIMESTAMPTZ)      -- workflow creation timestamp
+- created_at (TIMESTAMPTZ)      -- native (non-imported) workflow creation timestamp
 - last_updated_at (TIMESTAMPTZ)
+
+  ✅ Unified creation timestamp ONLY for recency questions (“recently created”, “most recently launched”, etc):
+
+      CASE
+        WHEN w.attributes ? 'importId'
+          THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+        ELSE w.created_at
+      END AS created_ts
+
+  ⚠️ Imported workflows that do NOT have smartImportProperty_predictionDate should be excluded
+     from “recently created/launched” results because no creation timestamp exists.
+
+  ⚠️ Do NOT use agreementDate, expirationDate, execution_date, or last_updated_at
+     as substitutes for created timestamps for imported workflows.
+
+  ✅ Sorting rule:
+      ORDER BY created_ts DESC NULLS LAST
+
+  ❌ Never use last_updated_at for workflow creation/launch logic.
+  ❌ Never guess creation timestamps for imports lacking predictionDate.
+
+-- Recently created / recently launched workflows (native + imported)
+  ✅ Use the unified created_ts defined above for ALL “recently created / most recently launched / most recent workflow” questions.
+  ✅ Exclude rows where created_ts IS NULL when sorting by recency.
+  ✅ Always sort with: ORDER BY created_ts DESC NULLS LAST
+  ❌ Do NOT fall back to last_updated_at, agreementDate, expirationDate, or execution_date for creation/launch logic.
+
+  General pattern (no extra filters, top 10 most recently created workflows):
+
+    SELECT readable_id, title, created_ts
+    FROM (
+      SELECT
+        w.readable_id,
+        w.title,
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+          ELSE w.created_at
+        END AS created_ts
+      FROM ic.workflows w
+    ) x
+    WHERE created_ts IS NOT NULL
+    ORDER BY created_ts DESC NULLS LAST
+    LIMIT 10;
+
+  Pattern with extra filters (e.g., most recent NDA workflow, or most recent workflows matching some condition):
+
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.readable_id,
+        w.title,
+        w.status,
+        w.record_type,
+        w.department,
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+          ELSE w.created_at
+        END AS created_ts
+      FROM ic.workflows w
+      -- Put simple row-level filters here if needed (e.g., title/record_type/vendor):
+      -- WHERE LOWER(w.title) LIKE '%nda%'
+    )
+    SELECT readable_id, title, created_ts
+    FROM wf
+    WHERE created_ts IS NOT NULL
+      -- Additional filters that also depend on created_ts can go here, for example:
+      -- AND LOWER(status) = 'active'
+      -- AND created_ts >= CURRENT_DATE - INTERVAL '30 days'
+    ORDER BY created_ts DESC NULLS LAST
+    LIMIT 10;
+
+  Examples:
+  - “List the most recent NDA workflow” →
+      use the pattern above with:
+        WHERE LOWER(w.title) LIKE '%nda%'   -- in the inner SELECT / CTE
+  - “Show the 10 most recently created SOW workflows” →
+        WHERE LOWER(w.record_type) = 'sow'
+  - “Show the 5 most recently launched workflows for the Finance department this month” →
+        add department-normalization joins if needed, and a
+        created_ts >= date_trunc('month', CURRENT_DATE)
+        AND created_ts <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month'
+
 - record_type (TEXT)            -- contract type (NDA, MSA, SOW, etc.)
   ✅ Use record_type for “How many NDAs/MSAs/SOWs?”
   ❌ Do not use document_type for contract type classification.
+
+  -- Contract type detection (NDA / MSA / SOW / etc.) for recency or listing questions
+  Some workflows (especially imported ones) do NOT populate record_type even when the
+  contract is clearly an NDA, MSA, SOW, etc. In those cases, the title reliably includes
+  the contract type keyword.
+
+  Therefore, for ANY question where the user explicitly names a contract type
+  (“recent NDA”, “latest NDA”, “most recent SOW”, “recent MSA”), ALWAYS use this
+  combined detection rule:
+
+       ContractTypeMatch('<type>'):
+            LOWER(w.record_type) = '<type>'
+            OR LOWER(w.title) ILIKE '%<type>%'
+
+  Examples:
+      ContractTypeMatch('nda') means:
+          LOWER(w.record_type) = 'nda'
+          OR LOWER(w.title) ILIKE '%nda%'
+
+  This combined rule MUST NOT be used unless the contract type is explicitly mentioned
+  in the user’s question.
+
+  All recency, listing, or filtering queries involving named contract types MUST apply
+  the ContractTypeMatch() logic and must still use the unified creation timestamp:
+
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+          ELSE w.created_at
+        END AS created_ts
+
+  Example SQL pattern:
+
+        WITH wf AS (
+          SELECT
+             w.readable_id,
+             w.title,
+             CASE
+               WHEN w.attributes ? 'importId'
+                 THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+               ELSE w.created_at
+             END AS created_ts
+          FROM ic.workflows w
+          WHERE (
+             LOWER(w.record_type) = 'nda'
+             OR LOWER(w.title) ILIKE '%nda%'
+          )
+        )
+        SELECT readable_id, title, created_ts
+        FROM wf
+        WHERE created_ts IS NOT NULL
+        ORDER BY created_ts DESC NULLS LAST
+        LIMIT 1;
+
+  Notes:
+  - Only use this combined detection rule when the user explicitly names a contract type.
+  - Do NOT apply this logic to unrelated questions (e.g., "recent workflows" → no NDA logic).
+
 
 - legal_entity (TEXT)
   ✅ When grouping/displaying, wrap with COALESCE(legal_entity, 'Unspecified Legal Entity').
@@ -902,43 +1044,83 @@ Table: step_states
 - state (TEXT)       -- e.g., 'not_started', 'in_progress', 'completed'
 
 Step-state logic:
-- Tracks the current progress state of major workflow steps like approvals and signatures.
-- This table replaces ic.approval_requests for counting or filtering by approval/signature progress.
+- Tracks the current progress state of major workflow steps.
+- Combined understanding for all workflow stages:
+
+  • Create / Archive → stored directly in ic.workflows.step
+  • Review / Sign → tracked via ic.step_states
+
+- Usage patterns:
+    • "Create" step  → w.status='active' AND LOWER(w.step)='create'
+    • "Review" step  → s.step_name='approvals' AND LOWER(s.state)='in_progress'
+    • "Sign" step    → s.step_name='signatures' AND LOWER(s.state)='in_progress'
+    • "Archive" step → w.status='active' AND LOWER(w.step)='archive'
+
 - Typical meanings:
-    • approvals + not_started → workflow has not entered approvals yet (still in setup or review)
-    • approvals + in_progress → workflow is currently in approval stage (pending approval)
+    • approvals + not_started → workflow has not entered approvals yet (still in create)
+    • approvals + in_progress → workflow is under review (review step)
     • approvals + completed   → approval stage finished
-    • signatures + not_started → approval completed, signing not yet begun
-    • signatures + in_progress → workflow is currently in signing stage (pending signature)
+    • signatures + in_progress → workflow is currently in signing stage (sign step)
     • signatures + completed   → fully signed and finished
+    • archive → workflow is completing final archiving steps (still active)
+
 - Interpretation rules:
-    • “Pending approval” → step_name='approvals' AND state='in_progress'
-    • “Pending signature” or “awaiting signature” → step_name='signatures' AND state='in_progress'
-    • “Fully signed” or “completed signatures” → step_name='signatures' AND state='completed'
-    • “Approvals not started” or “before approval stage” → step_name='approvals' AND state='not_started' (not counted as pending)
+    • “Pending approval” → step_name='approvals' AND LOWER(state)='in_progress'
+    • “Pending signature” or “awaiting signature” → step_name='signatures' AND LOWER(state)='in_progress'
+    • “Fully signed” or “completed signatures” → step_name='signatures' AND LOWER(state)='completed'
+    • “Create” / “Archive” stages → use w.step from ic.workflows (no entry in ic.step_states)
+
 - Always use LOWER(state) when filtering.
-- Example query patterns:
-    -- Workflows currently in approval stage
-    SELECT COUNT(*) AS pending_approvals
-    FROM ic.step_states
-    WHERE step_name = 'approvals'
-      AND LOWER(state) = 'in_progress';
 
-    -- Workflows currently in signing stage
-    SELECT COUNT(*) AS pending_signatures
-    FROM ic.step_states
-    WHERE step_name = 'signatures'
-      AND LOWER(state) = 'in_progress';
+Example query patterns:
 
-    -- Fully signed workflows
-    SELECT COUNT(*) AS signed_contracts
-    FROM ic.step_states
-    WHERE step_name = 'signatures'
-      AND LOWER(state) = 'completed';
+-- Workflows currently in Create step
+SELECT COUNT(*) AS workflows_in_create
+FROM ic.workflows w
+WHERE LOWER(w.status)='active'
+  AND LOWER(w.step)='create';
+
+-- Workflows currently in Review step
+SELECT COUNT(*) AS workflows_in_review
+FROM ic.step_states s
+JOIN ic.workflows w ON w.workflow_id=s.workflow_id
+WHERE s.step_name='approvals'
+  AND LOWER(s.state)='in_progress'
+  AND LOWER(w.status)='active';
+
+-- Workflows currently in Sign step
+SELECT COUNT(*) AS workflows_in_sign
+FROM ic.step_states s
+JOIN ic.workflows w ON w.workflow_id=s.workflow_id
+WHERE s.step_name='signatures'
+  AND LOWER(s.state)='in_progress'
+  AND LOWER(w.status)='active';
+
+-- Workflows currently in Archive step
+SELECT COUNT(*) AS workflows_in_archive
+FROM ic.workflows w
+WHERE LOWER(w.status)='active'
+  AND LOWER(w.step)='archive';
+
+-- All active workflows grouped by current step
+SELECT
+  CASE
+    WHEN LOWER(w.step)='create' THEN 'Create'
+    WHEN LOWER(w.step)='archive' THEN 'Archive'
+    WHEN s.step_name='approvals' AND LOWER(s.state)='in_progress' THEN 'Review'
+    WHEN s.step_name='signatures' AND LOWER(s.state)='in_progress' THEN 'Sign'
+  END AS current_step,
+  COUNT(DISTINCT w.workflow_id) AS workflows
+FROM ic.workflows w
+LEFT JOIN ic.step_states s ON s.workflow_id=w.workflow_id
+WHERE LOWER(w.status)='active'
+GROUP BY current_step
+ORDER BY current_step;
 
 - When users ask about pending approvals or signatures, always query ic.step_states instead of ic.approval_requests.
-- If the user adds filters (e.g., department, record type, legal entity), join back to ic.workflows:
-    JOIN ic.workflows w ON w.workflow_id = s.workflow_id
+- For Create/Archive, use ic.workflows.step directly.
+- When listing or grouping by step, combine both sources as shown above.
+- For additional filters (e.g., department, record_type, vendor), join ic.workflows as needed.
 
 Table: participants
 - workflow_id (TEXT, FK → workflows)
