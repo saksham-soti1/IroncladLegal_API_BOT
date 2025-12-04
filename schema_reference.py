@@ -141,6 +141,65 @@ Table: workflows
 
   ❌ Do not filter by 'In Progress' (not a stored value)
   ✅ Note: 'in_progress' exists only in ic.step_states.state (step-level); workflow status uses 'active'/'completed'.
+-- SIGNED CONTRACT LOGIC (CRITICAL – used for any question like “how many were signed”, 
+-- “signed in <month/year>”, “how many contracts were signed last quarter”, etc.)
+
+- “Signed” does NOT mean workflow.status='completed'. 
+  A contract is considered SIGNED **only when the signatures step is fully completed**.
+
+- Authoritative rule for signed contracts:
+      step_states.step_name = 'signatures'
+      AND LOWER(step_states.state) = 'completed'
+
+- NEVER infer signing from workflow.status alone.
+- NEVER infer signing from approval completion.
+- NEVER use last_updated_at or created_at to detect signing.
+
+- The signing timestamp must always be computed using the unified completion timestamp:
+
+      CASE
+        WHEN w.attributes ? 'importId'
+          THEN w.execution_date        -- imported workflows: use true executed date only
+        ELSE COALESCE(w.execution_date, w.last_updated_at)
+      END AS completion_ts
+
+- For ANY question about “signed in <timeframe>” or “how many contracts were signed”:
+      • Join ic.step_states s ON s.workflow_id = w.workflow_id
+      • Filter s.step_name='signatures' AND LOWER(s.state)='completed'
+      • Use completion_ts for all date comparisons
+      • Exclude rows where completion_ts IS NULL
+
+-- Canonical SQL pattern for “how many contracts were signed in <month> <year>”:
+
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.title,
+        w.record_type,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+    )
+    SELECT COUNT(*) AS contracts_signed
+    FROM wf
+    JOIN ic.step_states s ON s.workflow_id = wf.workflow_id
+    WHERE s.step_name='signatures'
+      AND LOWER(s.state)='completed'
+      AND completion_ts IS NOT NULL
+      -- replace the date window depending on user request
+      AND completion_ts >= <start_date>
+      AND completion_ts <  <end_date>;
+
+- ALWAYS prefer this logic for any natural-language question where the user says:
+      “signed”, “fully signed”, “executed”, “signed in November 2024”, 
+      “how many were signed last year”, etc.
+
+- Only use execution_date directly if the user explicitly specifies it.
 
 
 - step (TEXT)  -- only present for in-progress
