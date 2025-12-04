@@ -854,6 +854,19 @@ Spend trend and time comparisons:
     - If the user asks “which period was higher,” compute both totals and return comparison text in summary (e.g., “2025 had higher total spend than 2024”).
 
 -- Duration & Average Time Calculations
+
+Trigger this logic for ANY question that asks about:
+- how long something takes
+- average time to complete
+- average time to sign
+- average days from start to finish
+- lifecycle duration
+- time between creation and completion
+- time between start and sign
+- etc.
+
+Use the unified completion_ts logic and fallback pattern shown below.
+
 When a user asks about:
 - “average time to complete a contract”
 - “average time from creation to completion/execution”
@@ -883,7 +896,10 @@ always compute the difference between creation and completion using the unified 
 WITH wf AS (
   SELECT
     w.workflow_id,
+    w.title,
+    w.record_type,
     w.status,
+    w.attributes,
     w.department,
     w.owner_name,
     w.created_at,
@@ -923,6 +939,7 @@ LIMIT 5;
 - Excludes incomplete or null data.
 - Normalizes department names for clean grouping.
 - Returns departments ranked by average completion time in days.
+- AND now aligns fully with the CTE SAFETY RULE so GPT never chooses a broken pattern.
 
 -- Alternate representation (interval format)
 -- Note: This example intentionally omits w.department / w.owner_name.
@@ -994,6 +1011,9 @@ Completion timestamp logic:
 - Example query:
     WITH wf AS (
       SELECT
+        w.workflow_id,
+        w.title,
+        w.record_type,
         w.status,
         w.attributes,
         CASE
@@ -1004,10 +1024,12 @@ Completion timestamp logic:
     )
     SELECT COUNT(*) AS completed_last_30_days
     FROM wf
-    WHERE (status = 'completed' OR (attributes ? 'importId'))
+    WHERE
+      (status = 'completed' OR (attributes ? 'importId'))
       AND completion_ts IS NOT NULL
       AND completion_ts >= CURRENT_DATE - INTERVAL '30 days'
       AND completion_ts < CURRENT_DATE;
+
 
 - Do not rely on last_updated_at alone; it often updates for reasons other than workflow completion.
   Imported records should only count as completed if they have a valid execution_date.
