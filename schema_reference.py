@@ -209,7 +209,14 @@ Table: workflows
       "in review", "under review"      → 'Review'
       "in sign", "signing"             → 'Sign'
       "in archive", "archived"         → 'Archive'
+
   ⚠️ Always filter with exact DB values.
+    ✅ Stage resolution priority (for any “what stage/step is IC-#### in” question):
+      1) Always use w.step first. If w.step is non-null, it is the current stage and must be one of:
+         'Create', 'Review', 'Sign', 'Archive'.
+      2) Only fall back to ic.step_states when w.step IS NULL, using the Step-state logic rules below.
+         The four allowed output stages are still only: Create, Review, Sign, Archive.
+
 
 - is_complete (BOOLEAN)
 - is_cancelled (BOOLEAN)
@@ -1295,34 +1302,55 @@ Table: step_states
 
 Step-state logic:
 - Tracks the current progress state of major workflow steps.
-- Combined understanding for all workflow stages:
 
-  • Create / Archive → stored directly in ic.workflows.step
-  • Review / Sign → tracked via ic.step_states
+- Combined understanding for all workflow stages (authoritative rules):
 
-- Usage patterns:
-    • "Create" step  → w.status='active' AND LOWER(w.step)='create'
-    • "Review" step  → s.step_name='approvals' AND LOWER(s.state)='in_progress'
-    • "Sign" step    → s.step_name='signatures' AND LOWER(s.state)='in_progress'
-    • "Archive" step → w.status='active' AND LOWER(w.step)='archive'
+  • Primary source of truth for stage is ic.workflows.step.
+      - If w.step is non-null, it is the current stage and must be one of:
+        'Create', 'Review', 'Sign', 'Archive'.
+      - All “what stage/step is IC-#### in” questions must prefer w.step.
+
+  • ic.step_states is only used as a fallback when w.step IS NULL, and only to
+    infer one of the same four stages (Create, Review, Sign, Archive) using
+    the rules below.
+
+- Fallback interpretation when w.step IS NULL (stage inference rules):
+
+    • Signatures in progress or completed → stage = 'Sign'
+        - s.step_name = 'signatures'
+        - LOWER(s.state) IN ('in_progress','completed')
+
+    • Approvals in progress (no signatures in progress/completed) → stage = 'Review'
+        - s.step_name = 'approvals'
+        - LOWER(s.state) = 'in_progress'
+        - and there is no signatures row with LOWER(state) IN ('in_progress','completed')
+
+    • Approvals completed and signatures pending → stage = 'Sign'
+        - s.step_name = 'approvals'
+        - LOWER(s.state) = 'completed'
+        - and signatures are not yet fully completed
+          (no signatures row with LOWER(state) = 'completed')
+
+    • Otherwise (no approvals/signatures activity that meets the rules above)
+      → stage = 'Create'.
 
 - Typical meanings:
-    • approvals + not_started → workflow has not entered approvals yet (still in create)
-    • approvals + in_progress → workflow is under review (review step)
-    • approvals + completed   → approval stage finished
-    • signatures + in_progress → workflow is currently in signing stage (sign step)
-    • signatures + completed   → fully signed and finished
-    • archive → workflow is completing final archiving steps (still active)
+    • approvals + not_started → workflow has not entered approvals yet (still in Create)
+    • approvals + in_progress (no signatures in progress/completed) → Review stage
+    • approvals + completed + signatures not_started/pending → Sign stage
+    • signatures + in_progress → Sign stage
+    • signatures + completed → fully signed and finished (still Sign stage)
+    • w.step='archive' → Archive stage (ic.step_states is not consulted)
 
 - Interpretation rules:
-    • “Pending approval” → step_name='approvals' AND LOWER(state)='in_progress'
-    • “Pending signature” or “awaiting signature” → step_name='signatures' AND LOWER(state)='in_progress'
-    • “Fully signed” or “completed signatures” → step_name='signatures' AND LOWER(state)='completed'
-    • “Create” / “Archive” stages → use w.step from ic.workflows (no entry in ic.step_states)
+    • “Pending approval” → s.step_name='approvals' AND LOWER(state)='in_progress'
+    • “Pending signature” or “awaiting signature” → s.step_name='signatures' AND LOWER(state)='in_progress'
+    • “Fully signed” or “completed signatures” → s.step_name='signatures' AND LOWER(state)='completed'
+    • “Create” / “Archive” stages → always use w.step from ic.workflows when it is non-null.
 
 - Always use LOWER(state) when filtering.
 
-Example query patterns:
+Example query patterns (do not change existing pending-approval/signature patterns above):
 
 -- Workflows currently in Create step
 SELECT COUNT(*) AS workflows_in_create
@@ -1330,21 +1358,17 @@ FROM ic.workflows w
 WHERE LOWER(w.status)='active'
   AND LOWER(w.step)='create';
 
--- Workflows currently in Review step
+-- Workflows currently in Review step (explicit Review stage)
 SELECT COUNT(*) AS workflows_in_review
-FROM ic.step_states s
-JOIN ic.workflows w ON w.workflow_id=s.workflow_id
-WHERE s.step_name='approvals'
-  AND LOWER(s.state)='in_progress'
-  AND LOWER(w.status)='active';
+FROM ic.workflows w
+WHERE LOWER(w.status)='active'
+  AND LOWER(w.step)='review';
 
--- Workflows currently in Sign step
+-- Workflows currently in Sign step (explicit Sign stage)
 SELECT COUNT(*) AS workflows_in_sign
-FROM ic.step_states s
-JOIN ic.workflows w ON w.workflow_id=s.workflow_id
-WHERE s.step_name='signatures'
-  AND LOWER(s.state)='in_progress'
-  AND LOWER(w.status)='active';
+FROM ic.workflows w
+WHERE LOWER(w.status)='active'
+  AND LOWER(w.step)='sign';
 
 -- Workflows currently in Archive step
 SELECT COUNT(*) AS workflows_in_archive
@@ -1352,20 +1376,85 @@ FROM ic.workflows w
 WHERE LOWER(w.status)='active'
   AND LOWER(w.step)='archive';
 
--- All active workflows grouped by current step
+-- Single-workflow stage (preferred pattern for “what stage/step is IC-#### in”)
+-- This pattern uses w.step first, then falls back to step_states only if w.step IS NULL.
 SELECT
   CASE
     WHEN LOWER(w.step)='create' THEN 'Create'
+    WHEN LOWER(w.step)='review' THEN 'Review'
+    WHEN LOWER(w.step)='sign'   THEN 'Sign'
     WHEN LOWER(w.step)='archive' THEN 'Archive'
-    WHEN s.step_name='approvals' AND LOWER(s.state)='in_progress' THEN 'Review'
-    WHEN s.step_name='signatures' AND LOWER(s.state)='in_progress' THEN 'Sign'
+    ELSE
+      CASE
+        WHEN sig.step_name='signatures' AND LOWER(sig.state) IN ('in_progress','completed')
+          THEN 'Sign'
+        WHEN appr.step_name='approvals'
+             AND LOWER(appr.state)='in_progress'
+             AND NOT (
+               sig.step_name='signatures'
+               AND LOWER(sig.state) IN ('in_progress','completed')
+             )
+          THEN 'Review'
+        WHEN appr.step_name='approvals'
+             AND LOWER(appr.state)='completed'
+             AND NOT (
+               sig.step_name='signatures'
+               AND LOWER(sig.state)='completed'
+             )
+          THEN 'Sign'
+        ELSE 'Create'
+      END
+  END AS current_step
+FROM ic.workflows w
+LEFT JOIN ic.step_states appr
+  ON appr.workflow_id = w.workflow_id
+ AND appr.step_name = 'approvals'
+LEFT JOIN ic.step_states sig
+  ON sig.workflow_id = w.workflow_id
+ AND sig.step_name = 'signatures'
+WHERE w.readable_id = 'IC-7200'
+LIMIT 1;
+
+-- All active workflows grouped by current stage (w.step primary, same rules)
+SELECT
+  CASE
+    WHEN LOWER(w.step)='create' THEN 'Create'
+    WHEN LOWER(w.step)='review' THEN 'Review'
+    WHEN LOWER(w.step)='sign'   THEN 'Sign'
+    WHEN LOWER(w.step)='archive' THEN 'Archive'
+    ELSE
+      CASE
+        WHEN sig.step_name='signatures' AND LOWER(sig.state) IN ('in_progress','completed')
+          THEN 'Sign'
+        WHEN appr.step_name='approvals'
+             AND LOWER(appr.state)='in_progress'
+             AND NOT (
+               sig.step_name='signatures'
+               AND LOWER(sig.state) IN ('in_progress','completed')
+             )
+          THEN 'Review'
+        WHEN appr.step_name='approvals'
+             AND LOWER(appr.state)='completed'
+             AND NOT (
+               sig.step_name='signatures'
+               AND LOWER(sig.state)='completed'
+             )
+          THEN 'Sign'
+        ELSE 'Create'
+      END
   END AS current_step,
   COUNT(DISTINCT w.workflow_id) AS workflows
 FROM ic.workflows w
-LEFT JOIN ic.step_states s ON s.workflow_id=w.workflow_id
+LEFT JOIN ic.step_states appr
+  ON appr.workflow_id = w.workflow_id
+ AND appr.step_name = 'approvals'
+LEFT JOIN ic.step_states sig
+  ON sig.workflow_id = w.workflow_id
+ AND sig.step_name = 'signatures'
 WHERE LOWER(w.status)='active'
 GROUP BY current_step
 ORDER BY current_step;
+
 
 - When users ask about pending approvals or signatures, always query ic.step_states instead of ic.approval_requests.
 - For Create/Archive, use ic.workflows.step directly.
