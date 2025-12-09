@@ -10,6 +10,7 @@ from db import get_conn
 from schema_introspect import get_live_schema
 from schema_reference import SCHEMA_DESCRIPTION
 
+
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -30,11 +31,13 @@ def run_sql(sql: str, params: Optional[Tuple[Any,...]]=None, max_rows:int=400):
         with conn.cursor() as cur:
             cur.execute("SET LOCAL statement_timeout = 12000;")
             if params is None:
+                print("DEBUG RUN_SQL:", sql)
                 cur.execute(sql)
             else:
                 cur.execute(sql, params)
             cols = [d[0] for d in cur.description]
             rows = cur.fetchmany(max_rows)
+            print("DEBUG ROWS:", rows)
             return cols, rows
 
 # =========================================================
@@ -115,7 +118,11 @@ SELECT ...
 """
 
 SQL_FENCE_RE = re.compile(r"```sql\s*(.*?)```", re.IGNORECASE|re.DOTALL)
-PROHIBITED = re.compile(r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|MERGE|VACUUM|COPY|\\copy|SET\s+|SHOW\s+)\b", re.IGNORECASE)
+PROHIBITED = re.compile(
+    r"^\s*(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|GRANT|REVOKE|MERGE|VACUUM|COPY|SET|SHOW)\b",
+    re.IGNORECASE
+)
+
 
 def extract_sql(text:str)->str:
     m = SQL_FENCE_RE.search(text or "")
@@ -204,6 +211,8 @@ def build_general_summarizer_prompt() -> str:
         "- If grouping columns exist and one numeric column appears in all rows, assume it represents row-level counts.\n"
         "  If the question asks for a total, sum that column exactly — never guess.\n"
         "- If the result has only 1 row, report its value directly.\n"
+        "- If 'text_singleton_value' exists and is not null, use that value as the authoritative SQL answer.\n"
+        "  Write a concise 1–2 sentence interpretation of that value that answers the resolved_question.\n"
         "- Format money with $ and commas.\n"
         "- If zero rows, say 'No matching results were found, meaning no data was found for the given filters.'\n"
         "- Keep to 1–2 sentences; no SQL, no tables.\n"
@@ -405,8 +414,12 @@ def followup_rewriter(user_text: str,
         ]
     )
     txt = resp.choices[0].message.content or "{}"
+    print("DEBUG RAW REWRITER OUTPUT:", txt)
+
     try:
         js = json.loads(txt)
+        print("DEBUG PARSED REWRITER JSON:", js)
+
     except Exception:
         js = {
             "is_followup": False,
@@ -456,6 +469,7 @@ def is_followup(last_q: str, current_q: str) -> bool:
     ]
     resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=msgs)
     content = (resp.choices[0].message.content or "{}").strip()
+
     try:
         js = json.loads(content)
         return bool(js.get("followup", False))
@@ -490,6 +504,13 @@ Always return STRICT JSON in this format:
   "vendor_term":string|null,
   "notes":string|null
 }
+
+CRITICAL NON-NEGOTIABLE RULE:
+- "query_text" MUST be an EXACT character-for-character copy of the user's original question.
+- NEVER rewrite, rephrase, expand, shorten, or modify the user's question in any way.
+- NEVER add generic words like "contract", "agreement", "document", "clause", etc.
+- NEVER add vendor names, entity names, IC IDs, or inferred attributes unless the user explicitly typed them.
+- The assistant MUST preserve the original user wording exactly.
 
 ---
 
@@ -677,6 +698,8 @@ def classify_intent(q:str)->Dict[str,Any]:
     ]
     resp=client.chat.completions.create(model="gpt-4o-mini",temperature=0,messages=msgs)
     content=resp.choices[0].message.content or "{}"
+    print("DEBUG RAW INTENT LLM OUTPUT:", content)
+
     try: js=json.loads(_extract_first_json(content))
     except: js={}
     js.setdefault("intent","sql_generic")
@@ -684,12 +707,111 @@ def classify_intent(q:str)->Dict[str,Any]:
     js.setdefault("logic",{"operator":"AND","exclude":[]})
     js.setdefault("near",{"enabled":False,"window":120})
     js.setdefault("readable_ids",[])
+    # LLM sometimes outputs [None] or [null]. Remove them.
+    if js.get("readable_ids"):
+        cleaned = [rid for rid in js["readable_ids"] if isinstance(rid, str) and rid.strip()]
+        js["readable_ids"] = cleaned
+
+        # --- REMOVE NON-ID READABLE_IDS ---
+    valid_ids = []
+    for rid in js["readable_ids"]:
+        if isinstance(rid, str) and re.fullmatch(r"IC-\d+", rid.strip(), re.IGNORECASE):
+            valid_ids.append(rid.upper())
+    js["readable_ids"] = valid_ids
+
     js.setdefault("query_text",None)
     js.setdefault("vendor_term",None)
     js.setdefault("notes",None)
     if "clause" in q.lower():
         js["intent"] = "sql_generic"
+    print("DEBUG FINAL INTENT JSON:", js)
+    # --- SANITIZE READABLE IDS (remove None/null/etc.) ---
+    ids = js.get("readable_ids", [])
+    if not isinstance(ids, list):
+        ids = []
+    cleaned = []
+    for x in ids:
+        if isinstance(x, str) and x.strip():
+            cleaned.append(x.strip())
+    js["readable_ids"] = cleaned
     return js
+
+
+def extract_title_terms(question: str, known_titles: List[str]) -> List[str]:
+    """
+    Extract only the words from the user's question that refer to a contract title.
+    NO hallucination, NO invented tokens, NO generic stopword logic.
+    The model may ONLY choose words the user typed AND that appear in Known Titles.
+    """
+
+    # Build list of titles for the model to anchor to — prevents hallucination.
+    titles_text = "\n".join(f"- {t}" for t in known_titles)
+
+    system_prompt = (
+        "Your task is to extract ONLY the words from the user's question that identify the contract's title.\n"
+        "You are NOT summarizing, interpreting, answering, or reasoning about the question — "
+        "you are ONLY isolating the contract-title reference.\n\n"
+
+        "GENERAL PRINCIPLES:\n"
+        "• A 'contract-title word' is any word the user typed that is intended to NAME or REFER to the specific contract they mean.\n"
+        "• Users may reference titles in many ways: partial names, abbreviations, vendor names, document types, multi-word labels, etc.\n"
+        "• You must rely on the user's phrasing to determine which words function as the title reference.\n"
+        "• Contract-title words are typically the nouns and descriptors the user uses to specify WHICH contract they want.\n"
+        "• Words that serve only to ask the question (task words, clause/topic words, grammar words, politeness) "
+        "are NOT part of the title reference.\n"
+        "• DO NOT use hard-coded assumptions about which words are or are not titles — determine it from context.\n\n"
+
+       "STRICT RULES (NON-NEGOTIABLE):\n"
+        "1. You may ONLY return words EXACTLY as the user typed them (same characters; output them in lowercase).\n"
+        "2. You MUST NOT add, guess, infer, expand, substitute, or hallucinate any new word.\n"
+        "3. DO NOT return generic document words such as 'contract', 'agreement', 'document', 'form', 'application', or anything similar — unless they appear as part of a multi-word title phrase the user explicitly typed (e.g., 'Super Agreement', 'Pfizer Agreement').\n"
+        "4. DO NOT return any word whose ONLY purpose is grammatical or conversational.\n"
+        "5. A word must *contribute to uniquely identifying the title* — generic category words (contract, agreement, nda, msa, sow) MUST be paired with other title words typed by the user; do NOT return them alone.\n"
+        "6. If multiple contiguous user-typed words form a title reference (e.g., 'Pfizer Super Agreement'), return each as separate lowercase tokens in order.\n"
+        "7. If none of the user’s words match the Known Titles, return an empty list.\n"
+        "8. ALWAYS output strict JSON: {\"title_terms\": [\"word1\", \"word2\", ...]}.\n"
+
+    )
+
+    user_prompt = (
+        f"Known Titles:\n{titles_text}\n\n"
+        f"User Question: \"{question}\"\n\n"
+        "Return ONLY the minimal set of user-typed words that identify which contract the user is referencing."
+    )
+
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    )
+
+    txt = resp.choices[0].message.content or "{}"
+
+    try:
+        js = json.loads(_extract_first_json(txt))
+        out = js.get("title_terms", [])
+
+        # Final safety: enforce lowercase & ensure no hallucinated words and match against known titles
+        safe_terms = []
+        lowered_titles = [t.lower() for t in known_titles]
+
+        for term in out:
+            if not isinstance(term, str):
+                continue
+            term_l = term.lower()
+            # Keep only user-typed words that match actual titles
+            if any(term_l in title for title in lowered_titles):
+                safe_terms.append(term_l)
+
+        return safe_terms
+
+    except Exception:
+        return []
+
+
 
 # =========================================================
 # Deterministic helpers for text paths
@@ -833,14 +955,37 @@ def answer_question(
     scope["relevant_history"] = merged_history[-20:]
 
     # -- (2) Follow-up detector + rewriter (preferred path)
-    rew = followup_rewriter(
-        user_text=question,
-        relevant_history=relevant_history,
-        scope=scope,
-        prior_resolved_question=resolved_question
-    )
-    is_followup_turn = bool(rew.get("is_followup"))
-    resolved_q = rew.get("resolved_question") or question
+    print("DEBUG FIRST-TURN CHECK — last_question:", last_question)
+    print("DEBUG FIRST-TURN CHECK — prior_resolved_question:", resolved_question)
+    print("DEBUG FIRST-TURN CHECK — is_followup BEFORE rewriter SHOULD BE FALSE")
+
+        # --- FIRST TURN SAFETY: do NOT rewrite the user's question ---
+    if last_question is None:
+        print("DEBUG: FIRST TURN — SKIPPING REWRITER ENTIRELY")
+        is_followup_turn = False
+        resolved_q = question
+
+        # Ensure rew exists so later code does not crash
+        rew = {"reset_keys": [], "scope_updates": {}}
+    else:
+        rew = followup_rewriter(
+            user_text=question,
+            relevant_history=relevant_history,
+            scope=scope,
+            prior_resolved_question=resolved_question
+        )
+        is_followup_turn = bool(rew.get("is_followup"))
+        resolved_q = rew.get("resolved_question") or question
+
+
+    print("DEBUG IS_FOLLOWUP_TURN:", is_followup_turn)
+    print("DEBUG RESOLVED_Q AFTER FIRST-TURN LOGIC:", resolved_q)
+
+    # -- (3) Intent classification on the RESOLVED question
+    intent = classify_intent(resolved_q)
+    print("DEBUG INTENT:", intent)
+    print("DEBUG RESOLVED QUESTION:", resolved_q)
+
 
     # Merge scope updates & apply resets when the rewriter signals a new topic
     resets = rew.get("reset_keys") or []
@@ -860,8 +1005,7 @@ def answer_question(
         except Exception:
             pass
 
-    # -- (3) Intent classification on the RESOLVED question
-    intent = classify_intent(resolved_q)
+
     is_weekly = (intent.get("intent") == "weekly_report")
 
     # ===========================================
@@ -923,11 +1067,60 @@ def answer_question(
     # ===========================================
     if intent["intent"] == "rag_text_qa":
         # --- Detect single vs multi-contract scope ---
+        # --- Detect single vs multi-contract scope ---
         readable_ids = intent.get("readable_ids") or (primary_response or {}).get("example_ids") or []
+
+        # Attempt fallback: check title match if no IC-ID provided
+        # Attempt fallback: fuzzy title match using model-based title term extraction
+        if not readable_ids:
+            # 1. Fetch known titles (anchor set)
+            cols, title_rows = run_sql("SELECT title FROM ic.contract_texts")
+            known_titles = [r[0] for r in title_rows if r[0]]
+
+            # 2. Extract title-identifying tokens using the safe LLM helper
+            candidate_terms = extract_title_terms(resolved_q, known_titles)
+            print("DEBUG TITLE TERMS:", candidate_terms)
+
+            if candidate_terms:
+                like_clauses = " AND ".join(["LOWER(title) ILIKE %s" for _ in candidate_terms])
+                params = [f"%{t}%" for t in candidate_terms]
+
+                sql = f"""
+                    SELECT readable_id
+                    FROM ic.contract_texts
+                    WHERE {like_clauses}
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """
+
+                print("DEBUG TITLE SEARCH SQL:", sql)
+                print("DEBUG TITLE SEARCH PARAMS:", params)
+
+                cols, rows = run_sql(sql, tuple(params))
+                if rows:
+                    readable_ids = [rows[0][0]]
+
+
         is_single_contract = len(readable_ids) == 1
         rid = readable_ids[0] if is_single_contract else None
-
+        if not readable_ids:
+            return {
+                "sql": "",
+                "columns": [],
+                "rows": [],
+                "stream": iter(["I'm sorry, I couldn't find a matching contract based on the title keywords."]),
+                "intent_json": intent,
+                "conversation_summary": updated_summary,
+                "scope": scope,
+                "resolved_question": resolved_q,
+                "primary_response": {
+                    "type": "text",
+                    "value": "No matching contract found for title keywords",
+                    "context": "title fallback failure"
+                }
+            }
         qvec = embed_query(resolved_q)
+
 
         if is_single_contract:
             # single-contract: narrow to one doc
@@ -1209,12 +1402,26 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
         single_sql = sections[0]["sql"] if sections else sql
         cols, rows = run_sql(single_sql, params)
 
+        print("DEBUG: SINGLE SQL:", single_sql)
+        print("DEBUG: PARAMS:", params)
+    
+
         # Build exec-brief with prior anchor (if follow-up)
         numeric_value = None
+        new_primary = None
+        text_singleton_value = None
+
+        # Case 1: single-row single-column
         if len(rows) == 1 and len(cols) == 1:
             val = rows[0][0]
+
             if isinstance(val, (int, float, Decimal)):
                 numeric_value = float(val)
+            else:
+                # store the text result explicitly so the summarizer can use it
+                text_singleton_value = str(val)
+
+        
 
         payload = {
             "question": resolved_q,
@@ -1223,6 +1430,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "rows_preview": safe_json(rows[:50]),
             "row_count_returned": len(rows),
             "true_numeric_result": numeric_value,
+            "text_singleton_value": text_singleton_value,
             "intent": intent,
             "scope": scope,
             "relevant_history": scope.get("relevant_history", []),
@@ -1238,8 +1446,6 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             stream=True,
         )
 
-               # ✅ Build next-turn anchor for follow-ups
-        new_primary = None
 
         if numeric_value is not None:
             # simple scalar result (e.g., “106”)
@@ -1299,6 +1505,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
 
     except Exception as e:
         # Error → Exec-brief the error cleanly
+        print("DEBUG SQL EXCEPTION:", repr(e))
         payload = {
             "question": resolved_q,
             "sql": sql if "sql" in locals() else "",
