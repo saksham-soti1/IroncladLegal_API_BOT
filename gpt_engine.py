@@ -323,6 +323,25 @@ RULES:
 
 -- FOLLOW-UP DETECTION --
 
+Elliptical Follow-Ups (Critical Rule):
+
+- You MUST mark is_followup = true when the new user message is NOT a complete
+  standalone question by itself AND requires the prior_resolved_question to make sense.
+
+  A message is considered NOT standalone when:
+    • it lacks a subject or object (“list them”, “show me”, “break it down”, “and the rest?”)
+    • it uses incomplete references (“what about pricing?”, “and termination?”, “the vendor?”)
+    • it only makes sense when tied to the prior question’s scope, entity, timeframe, or filters
+    • its meaning is ambiguous or empty without the previous context
+
+- In these cases:
+    • treat the message as a follow-up even if no explicit referential keywords appear
+    • inherit the prior scope exactly (unless user overrides it explicitly)
+    • resolved_question must embed the prior context clearly
+
+This rule ALWAYS applies before any other follow-up rules.
+
+
 - You MUST mark is_followup = true only when the new message clearly depends on or refers back to the prior result, including:
     • Referential language: "those", "these", "that", "them", "of the ones", "what about", "and how many of those"
     • Incremental filters: "only high priority", "just legal", "by department", "from counterparties"
@@ -1068,7 +1087,14 @@ def answer_question(
     if intent["intent"] == "rag_text_qa":
         # --- Detect single vs multi-contract scope ---
         # --- Detect single vs multi-contract scope ---
-        readable_ids = intent.get("readable_ids") or (primary_response or {}).get("example_ids") or []
+        # NEVER use semantic nearest-neighbors to determine contract scope.
+# Only use explicit IDs or title extraction.
+        readable_ids = intent.get("readable_ids") or []
+        # If this is a follow-up RAG query AND no explicit new contract was given,
+        # lock onto the previously active contract
+        if is_followup_turn and scope.get("active_contract_id") and not intent.get("readable_ids"):
+            readable_ids = [scope["active_contract_id"]]
+
 
         # Attempt fallback: check title match if no IC-ID provided
         # Attempt fallback: fuzzy title match using model-based title term extraction
@@ -1124,6 +1150,8 @@ def answer_question(
 
         if is_single_contract:
             # single-contract: narrow to one doc
+            # Remember active contract for follow-ups
+            scope["active_contract_id"] = rid
             sql = """
                 SELECT readable_id, chunk_id, chunk_text,
                        (embedding <=> %s::vector) AS distance
