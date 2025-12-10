@@ -244,6 +244,29 @@ Table: workflows
   ❌ Never use last_updated_at for workflow creation/launch logic.
   ❌ Never guess creation timestamps for imports lacking predictionDate.
 
+CRITICAL RULE FOR ALL “CREATED / LAUNCHED / LAST X DAYS” QUESTIONS:
+- ANY question asking “how many workflows were created…”, 
+  “how many were launched…”, “created in the last 7 days”, 
+  “created this week/month/year”, or any natural-language variation
+  MUST ALWAYS use the unified created_ts logic:
+
+      CASE
+        WHEN w.attributes ? 'importId'
+          THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+        ELSE w.created_at
+      END AS created_ts
+
+- NEVER use w.created_at alone for ANY count or list of created workflows.
+  Doing so will incorrectly exclude imported workflows entirely.
+
+- ALL creation-window filters MUST be written as:
+      created_ts >= <start>
+      AND created_ts <  <end>
+
+This ensures consistency between "how many were created" 
+and "list them" for all native + imported workflows.
+
+
 -- Recently created / recently launched workflows (native + imported)
   ✅ Use the unified created_ts defined above for ALL “recently created / most recently launched / most recent workflow” questions.
   ✅ Exclude rows where created_ts IS NULL when sorting by recency.
