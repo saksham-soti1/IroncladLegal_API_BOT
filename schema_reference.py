@@ -55,6 +55,30 @@ SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
       w.status,
       w.attributes
 
+        **ADDITIONAL REQUIRED RULE FOR TIME / VALUE / COMPLETION QUESTIONS**
+
+  When the user’s question involves:
+    • any time window (e.g., “in 2025”, “last year”, “past 30 days”)
+    • executed/signed/completed workflows
+    • contract_value_amount
+    • “most expensive”, “highest value”, “least expensive”
+    • yearly/quarterly/monthly comparisons
+    • spend / totals / contract value
+
+  Then the CTE MUST ALSO include the unified completion timestamp:
+
+      CASE
+        WHEN w.attributes ? 'importId' THEN w.execution_date
+        ELSE COALESCE(w.execution_date, w.last_updated_at)
+      END AS completion_ts,
+
+  The model MUST NOT reference completion_ts in the outer SELECT or WHERE
+  unless it is explicitly selected in the CTE.
+
+  This field is REQUIRED for ANY query that compares, orders, filters, groups,
+  or constrains results based on completion date or contract value.
+
+
   Example baseline pattern (you can add more fields, but never drop these):
 
       WITH wf AS (
@@ -72,6 +96,58 @@ SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
   - Never reference wf.title, wf.record_type, wf.status, or wf.attributes outside the CTE
     unless they were selected in the CTE.
   - Never reference any column from wf that you did not explicitly SELECT in the CTE.
+  
+  🔒 CTE ALIAS REFERENCE RULE (HARD CONSTRAINT – NEVER VIOLATE THIS)
+
+  Inside a CTE (`WITH wf AS (...)`), SQL SELECT aliases cannot be referenced in
+  the WHERE clause of the same CTE. Aliases only exist *after* the SELECT finishes.
+
+  Therefore:
+
+  • The model MUST NOT reference any SELECT alias inside the CTE WHERE.
+      Forbidden examples inside the CTE:
+        AND completion_ts >= ...
+        AND created_ts >= ...
+        AND any other computed alias
+
+  • All time-window and value-window filters must be applied in the OUTER QUERY
+    unless the full CASE expression is repeated verbatim.
+
+  • Default and required safe pattern:
+
+      WITH wf AS (
+        SELECT
+          w.workflow_id,
+          w.title,
+          w.record_type,
+          w.status,
+          w.attributes,
+          w.contract_value_amount,
+          w.contract_value_currency,
+          CASE
+            WHEN w.attributes ? 'importId' THEN w.execution_date
+            ELSE COALESCE(w.execution_date, w.last_updated_at)
+          END AS completion_ts
+        FROM ic.workflows w
+        WHERE
+          (w.status = 'completed' OR w.attributes ? 'importId')
+          AND w.contract_value_amount IS NOT NULL
+      )
+      SELECT *
+      FROM wf
+      WHERE completion_ts IS NOT NULL
+        AND completion_ts >= <start_date>
+        AND completion_ts <  <end_date>;
+
+  • If any alias appears in the CTE WHERE clause, the SQL is invalid and must be rewritten.
+
+  • This rule applies to all questions involving:
+      - time windows (“in 2025”, “last quarter”, “past 30 days”, etc.)
+      - completed/executed/signed workflows
+      - contract_value_amount or currency logic
+      - “most expensive”, “highest value”, “least expensive”
+      - year/quarter/month comparisons
+      - spend/value summaries
 
 - Time logic and contract type logic MUST follow the rules below.
   • For “completed/executed/finished” time windows, always use the unified completion_ts CASE pattern defined later.
