@@ -706,45 +706,71 @@ def _extract_first_json(txt:str)->str:
                 return t[start:i+1]
     return "{}"
 
-def classify_intent(q:str)->Dict[str,Any]:
-    ids=[m.group(0).upper() for m in IC_ID_RE.finditer(q)]
-    quoted=re.findall(r"['\"]([^'\"]+)['\"]",q)
-    hints={"readable_ids_detected":ids,"quoted_terms_detected":quoted}
-    msgs=[
-        {"role":"system","content":INTENT_SYSTEM_PROMPT},
-        {"role":"system","content":"HINTS: "+json.dumps(hints)},
-        {"role":"user","content":q},
+def classify_intent(q: str) -> Dict[str, Any]:
+    ids = [m.group(0).upper() for m in IC_ID_RE.finditer(q)]
+    quoted = re.findall(r"['\"]([^'\"]+)['\"]", q)
+    hints = {"readable_ids_detected": ids, "quoted_terms_detected": quoted}
+
+    msgs = [
+        {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+        {"role": "system", "content": "HINTS: " + json.dumps(hints)},
+        {"role": "user", "content": q},
     ]
-    resp=client.chat.completions.create(model="gpt-4o-mini",temperature=0,messages=msgs)
-    content=resp.choices[0].message.content or "{}"
+
+    resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=msgs)
+    content = resp.choices[0].message.content or "{}"
     print("DEBUG RAW INTENT LLM OUTPUT:", content)
 
-    try: js=json.loads(_extract_first_json(content))
-    except: js={}
-    js.setdefault("intent","sql_generic")
-    js.setdefault("terms",[])
-    js.setdefault("logic",{"operator":"AND","exclude":[]})
-    js.setdefault("near",{"enabled":False,"window":120})
-    js.setdefault("readable_ids",[])
-    # LLM sometimes outputs [None] or [null]. Remove them.
+    try:
+        js = json.loads(_extract_first_json(content))
+    except:
+        js = {}
+
+    # Default shape
+    js.setdefault("intent", "sql_generic")
+    js.setdefault("terms", [])
+    js.setdefault("logic", {"operator": "AND", "exclude": []})
+    js.setdefault("near", {"enabled": False, "window": 120})
+    js.setdefault("readable_ids", [])
+
+    # LLM sometimes outputs [None] or [null] or non-list → clean it
     if js.get("readable_ids"):
         cleaned = [rid for rid in js["readable_ids"] if isinstance(rid, str) and rid.strip()]
         js["readable_ids"] = cleaned
 
-        # --- REMOVE NON-ID READABLE_IDS ---
+    # ---- 🔥 HARD NORMALIZATION FIX (prevents NoneType iteration crashes) ----
+    # Terms must always be a list
+    if js.get("terms") is None:
+        js["terms"] = []
+
+    # Logic must always be a properly shaped dict
+    if js.get("logic") is None or not isinstance(js["logic"], dict):
+        js["logic"] = {"operator": "AND", "exclude": []}
+    else:
+        js["logic"].setdefault("operator", "AND")
+        js["logic"].setdefault("exclude", [])
+        if js["logic"]["exclude"] is None:
+            js["logic"]["exclude"] = []
+    # ---- end fix ----
+
+    # Normalize readable IDs → only valid IC-#### allowed
     valid_ids = []
     for rid in js["readable_ids"]:
         if isinstance(rid, str) and re.fullmatch(r"IC-\d+", rid.strip(), re.IGNORECASE):
             valid_ids.append(rid.upper())
     js["readable_ids"] = valid_ids
 
-    js.setdefault("query_text",None)
-    js.setdefault("vendor_term",None)
-    js.setdefault("notes",None)
+    js.setdefault("query_text", None)
+    js.setdefault("vendor_term", None)
+    js.setdefault("notes", None)
+
+    # Special rule for "clause"
     if "clause" in q.lower():
         js["intent"] = "sql_generic"
+
     print("DEBUG FINAL INTENT JSON:", js)
-    # --- SANITIZE READABLE IDS (remove None/null/etc.) ---
+
+    # Final sanitize of readable_ids
     ids = js.get("readable_ids", [])
     if not isinstance(ids, list):
         ids = []
@@ -753,57 +779,55 @@ def classify_intent(q:str)->Dict[str,Any]:
         if isinstance(x, str) and x.strip():
             cleaned.append(x.strip())
     js["readable_ids"] = cleaned
+
     return js
 
 
-def extract_title_terms(question: str, known_titles: List[str]) -> List[str]:
-    """
-    Extract only the words from the user's question that refer to a contract title.
-    NO hallucination, NO invented tokens, NO generic stopword logic.
-    The model may ONLY choose words the user typed AND that appear in Known Titles.
-    """
 
-    # Build list of titles for the model to anchor to — prevents hallucination.
-    titles_text = "\n".join(f"- {t}" for t in known_titles)
+def extract_title_terms(question: str) -> List[str]:
+    """
+    Extract the specific title-identifying words the user typed.
+    This uses ONLY the question itself (no title list).
+    """
 
     system_prompt = (
-        "Your task is to extract ONLY the words from the user's question that identify the contract's title.\n"
-        "You are NOT summarizing, interpreting, answering, or reasoning about the question — "
-        "you are ONLY isolating the contract-title reference.\n\n"
+        "Your ONLY task is to extract the exact user-typed words that identify a contract title.\n"
+        "You do NOT answer the question.\n"
+        "You do NOT need to know the list of titles.\n"
+        "You ONLY pull out the meaningful title-indicating words the user typed.\n\n"
 
-        "GENERAL PRINCIPLES:\n"
-        "• A 'contract-title word' is any word the user typed that is intended to NAME or REFER to the specific contract they mean.\n"
-        "• Users may reference titles in many ways: partial names, abbreviations, vendor names, document types, multi-word labels, etc.\n"
-        "• You must rely on the user's phrasing to determine which words function as the title reference.\n"
-        "• Contract-title words are typically the nouns and descriptors the user uses to specify WHICH contract they want.\n"
-        "• Words that serve only to ask the question (task words, clause/topic words, grammar words, politeness) "
-        "are NOT part of the title reference.\n"
-        "• DO NOT use hard-coded assumptions about which words are or are not titles — determine it from context.\n\n"
+        "WHAT TO EXTRACT:\n"
+        "- Company/vendor names (e.g., hamilton, lonza, pfizer, stanford)\n"
+        "- Contract-type indicators the user typed (e.g., nda, msa, dmsa, cda, sow)\n"
+        "- Product/model identifiers if present (e.g., abc123)\n\n"
 
-       "STRICT RULES (NON-NEGOTIABLE):\n"
-        "1. You may ONLY return words EXACTLY as the user typed them (same characters; output them in lowercase).\n"
-        "2. You MUST NOT add, guess, infer, expand, substitute, or hallucinate any new word.\n"
-        "3. DO NOT return generic document words such as 'contract', 'agreement', 'document', 'form', 'application', or anything similar — unless they appear as part of a multi-word title phrase the user explicitly typed (e.g., 'Super Agreement', 'Pfizer Agreement').\n"
-        "4. DO NOT return any word whose ONLY purpose is grammatical or conversational.\n"
-        "5. A word must *contribute to uniquely identifying the title* — generic category words (contract, agreement, nda, msa, sow) MUST be paired with other title words typed by the user; do NOT return them alone.\n"
-        "6. If multiple contiguous user-typed words form a title reference (e.g., 'Pfizer Super Agreement'), return each as separate lowercase tokens in order.\n"
-        "7. If none of the user’s words match the Known Titles, return an empty list.\n"
-        "8. ALWAYS output strict JSON: {\"title_terms\": [\"word1\", \"word2\", ...]}.\n"
+        "WHAT NOT TO EXTRACT:\n"
+        "- Clause/topic words (confidentiality, payment, pricing)\n"
+        "- Generic verbs or filler language (what, does, say, show, about)\n\n"
 
+        "EXAMPLES:\n"
+        "User: 'What does the Hamilton Company NDA say about confidentiality?'\n"
+        "Output: {\"title_terms\": [\"hamilton\", \"company\", \"nda\"]}\n\n"
+        "User: 'Explain the Lonza DMSA termination clause'\n"
+        "Output: {\"title_terms\": [\"lonza\", \"dmsa\"]}\n\n"
+        "User: 'Show me what the Pfizer Master Services Agreement says about IP'\n"
+        "Output: {\"title_terms\": [\"pfizer\", \"master\", \"services\"]}\n\n"
+
+        "RULES:\n"
+        "- Only return words the user actually typed.\n"
+        "- Lowercase all extracted words.\n"
+        "- Never hallucinate or infer new words.\n"
+        "- Always output strict JSON: {\"title_terms\": [ ... ]}"
     )
 
-    user_prompt = (
-        f"Known Titles:\n{titles_text}\n\n"
-        f"User Question: \"{question}\"\n\n"
-        "Return ONLY the minimal set of user-typed words that identify which contract the user is referencing."
-    )
+    user_prompt = f"User Question: \"{question}\""
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
     )
 
@@ -812,24 +836,9 @@ def extract_title_terms(question: str, known_titles: List[str]) -> List[str]:
     try:
         js = json.loads(_extract_first_json(txt))
         out = js.get("title_terms", [])
-
-        # Final safety: enforce lowercase & ensure no hallucinated words and match against known titles
-        safe_terms = []
-        lowered_titles = [t.lower() for t in known_titles]
-
-        for term in out:
-            if not isinstance(term, str):
-                continue
-            term_l = term.lower()
-            # Keep only user-typed words that match actual titles
-            if any(term_l in title for title in lowered_titles):
-                safe_terms.append(term_l)
-
-        return safe_terms
-
+        return [w.lower() for w in out if isinstance(w, str)]
     except Exception:
         return []
-
 
 
 # =========================================================
@@ -1100,13 +1109,43 @@ def answer_question(
         # Attempt fallback: fuzzy title match using model-based title term extraction
         if not readable_ids:
             # 1. Fetch known titles (anchor set)
-            cols, title_rows = run_sql("SELECT title FROM ic.contract_texts")
-            known_titles = [r[0] for r in title_rows if r[0]]
+            # -------------------------------------------
+            # NEW PREFILTER: detect user words & limit title set BEFORE LLM extraction
+            # -------------------------------------------
+            # Extract raw user-typed words
+            raw_words = re.findall(r"[a-zA-Z0-9]+", resolved_q.lower())
+            title_words = [w for w in raw_words if len(w) >= 3]
+            print("DEBUG RAW WORDS:", raw_words)
+            print("DEBUG TITLE WORDS (words >=3 chars):", title_words)
 
-            # 2. Extract title-identifying tokens using the safe LLM helper
-            candidate_terms = extract_title_terms(resolved_q, known_titles)
+
+            prefiltered_titles = []
+            if title_words:
+                where_clauses = " AND ".join(["LOWER(title) ILIKE %s" for _ in title_words])
+                params = [f"%{w}%" for w in title_words]
+
+                sql_prefilter = f"""
+                    SELECT title
+                    FROM ic.contract_texts
+                    WHERE {where_clauses}
+                    LIMIT 10
+                """
+
+                print("DEBUG PREFILTER TITLE SQL:", sql_prefilter)
+                print("DEBUG PREFILTER PARAMS:", params)
+
+                cols, title_rows = run_sql(sql_prefilter, tuple(params))
+                prefiltered_titles = [r[0] for r in title_rows if r[0]]
+                print("DEBUG PREFILTERED_TITLES_COUNT:", len(prefiltered_titles))
+                print("DEBUG FIRST_5_PREFILTERED_TITLES:", prefiltered_titles[:5])
+
+
+
+            candidate_terms = extract_title_terms(resolved_q)
+            print("DEBUG CANDIDATE TERMS FROM LLM:", candidate_terms)
             print("DEBUG TITLE TERMS:", candidate_terms)
 
+            print("DEBUG TYPE OF CANDIDATE_TERMS:", type(candidate_terms))
             if candidate_terms:
                 like_clauses = " AND ".join(["LOWER(title) ILIKE %s" for _ in candidate_terms])
                 params = [f"%{t}%" for t in candidate_terms]
@@ -1125,6 +1164,7 @@ def answer_question(
                 cols, rows = run_sql(sql, tuple(params))
                 if rows:
                     readable_ids = [rows[0][0]]
+
 
 
         is_single_contract = len(readable_ids) == 1
