@@ -96,7 +96,7 @@ SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
   - Never reference wf.title, wf.record_type, wf.status, or wf.attributes outside the CTE
     unless they were selected in the CTE.
   - Never reference any column from wf that you did not explicitly SELECT in the CTE.
-  
+
   🔒 CTE ALIAS REFERENCE RULE (HARD CONSTRAINT – NEVER VIOLATE THIS)
 
   Inside a CTE (`WITH wf AS (...)`), SQL SELECT aliases cannot be referenced in
@@ -635,6 +635,44 @@ Routing rule:
     • signatures → LOWER(ra.role_id) LIKE '%signer%'
 - Use ic.approval_requests only for history/decisions (approved dates, reassigned), not for current pending counts.
 
+  🔒 WORKFLOW-SPECIFIC APPROVAL STATUS (Pattern B — REQUIRED ROUTING RULE)
+
+  When a user asks:
+    • “Who is pending approval for <workflow>?”
+    • “Who hasn’t approved yet?”
+    • “Who still needs to approve?”
+    • “Who has approved vs who is pending?”
+    • “Show approval status for IC-####”
+
+  The assistant MUST use the approval-history pattern based on:
+    • ic.approval_requests  (authoritative approval history)
+    • ic.role_assignees     (to resolve names/emails)
+    • ic.workflows          (to filter by workflow/readable_id)
+
+  This pattern MUST NOT use:
+    • ic.step_states
+    • any pending-only logic
+    • any workflow-stage inference
+
+  Canonical SQL pattern (mandatory):
+
+    SELECT ra.user_name,
+           ra.email,
+           LOWER(a.status) AS approval_status
+    FROM ic.approval_requests a
+    JOIN ic.role_assignees ra
+         ON ra.workflow_id = a.workflow_id
+        AND ra.role_id = a.role_id
+    JOIN ic.workflows w
+         ON w.workflow_id = a.workflow_id
+    WHERE w.readable_id = '<IC-####>'
+      AND LOWER(a.status) IN ('approved','pending');
+
+  This returns the full approval status list for the workflow:
+    • who has approved
+    • who is still pending
+
+
 Time windows (always anchor to CURRENT_DATE):
 - Month:
     a.end_time >= date_trunc('month', CURRENT_DATE)
@@ -676,77 +714,102 @@ Workflow scope:
 
 Role-based queries:
 - Always group by a.role_name (not ra.role_name).
+- Name matching for people MUST use the full name or full email provided by the user.
+  • Do NOT truncate first names (e.g., "stephanie" → keep "stephanie").
+  • Use ILIKE '%<name>%' only to allow flexible matching of full names and emails.
 
-Examples:
+----------------------------------------------------------------------
+-- APPROVER ANALYTICS (approval history; time-window aware)
+----------------------------------------------------------------------
 
--- ✅ Approvals by Jane Doe (all time)
+-- ✅ Approvals by <person> (all time)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
-  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%');
+  AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%');
 
--- ✅ Approvals by Jane Doe (this month)
+-- ✅ Approvals by <person> (this month)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
-  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
+  AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%')
   AND a.end_time >= date_trunc('month', CURRENT_DATE)
   AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month';
 
--- ✅ Approvals by Jane Doe (last 3 months)
+-- ✅ Approvals by <person> (last 3 months)
 SELECT COUNT(DISTINCT a.workflow_id) AS workflows_approved
 FROM ic.approval_requests a
-JOIN ic.role_assignees ra ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
-JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
-  AND (LOWER(ra.user_name) ILIKE '%jane%' OR LOWER(ra.email) ILIKE '%jane%')
+  AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%')
   AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
   AND a.end_time < CURRENT_DATE;
 
--- ✅ Generic pending approvals (current state, not history)
+----------------------------------------------------------------------
+-- GENERIC PENDING COUNTS (Pattern: step_states – NOT approval history)
+----------------------------------------------------------------------
+
+-- ✅ Generic pending approvals (current step state, not history)
 SELECT COUNT(*) AS pending_approvals
 FROM ic.step_states s
 JOIN ic.workflows w ON w.workflow_id = s.workflow_id
 WHERE s.step_name = 'approvals'
   AND LOWER(s.state) = 'in_progress'
-  AND w.status = 'active';
+  AND LOWER(w.status) = 'active';
 
--- ✅ Generic pending signatures (current state, not history)
+-- ✅ Generic pending signatures (current step state, not history)
 SELECT COUNT(*) AS pending_signatures
 FROM ic.step_states s
 JOIN ic.workflows w ON w.workflow_id = s.workflow_id
 WHERE s.step_name = 'signatures'
   AND LOWER(s.state) = 'in_progress'
-  AND w.status = 'active';
+  AND LOWER(w.status) = 'active';
 
--- ✅ Person-specific pending approvals (requires approver role + in_progress)
+----------------------------------------------------------------------
+-- PERSON-SPECIFIC PENDING 
+-- (Used when user asks: “Is <person> pending approval/signature?”)
+----------------------------------------------------------------------
+
+-- ✅ Person-specific pending approvals, use name that they passed in. If only first name is provided, only first name. If both are provided, use both.
 SELECT COUNT(*) AS pending_for_person
 FROM ic.step_states s
 JOIN ic.workflows w       ON w.workflow_id = s.workflow_id
 JOIN ic.role_assignees ra ON ra.workflow_id = s.workflow_id
 WHERE s.step_name = 'approvals'
   AND LOWER(s.state) = 'in_progress'
-  AND w.status = 'active'
+  AND LOWER(w.status) = 'active'
   AND LOWER(ra.role_id) LIKE '%approver%'
-  AND (LOWER(ra.user_name) ILIKE '%stephanie%' OR LOWER(ra.email) ILIKE '%stephanie%');
+  AND (LOWER(ra.user_name) ILIKE '%stephanie haycox%' OR LOWER(ra.email) ILIKE '%stephanie haycox%');
 
--- ✅ Person-specific pending signatures (requires signer role + in_progress)
+-- ✅ Person-specific pending signatures
 SELECT COUNT(*) AS pending_signatures_for_person
 FROM ic.step_states s
 JOIN ic.workflows w       ON w.workflow_id = s.workflow_id
 JOIN ic.role_assignees ra ON ra.workflow_id = s.workflow_id
 WHERE s.step_name = 'signatures'
   AND LOWER(s.state) = 'in_progress'
-  AND w.status = 'active'
+  AND LOWER(w.status) = 'active'
   AND LOWER(ra.role_id) LIKE '%signer%'
-  AND (LOWER(ra.user_name) ILIKE '%angela%' OR LOWER(ra.email) ILIKE '%angela%');
+  AND (LOWER(ra.user_name) ILIKE '%angela smith%' OR LOWER(ra.email) ILIKE '%angela smith%');
 
--- ✅ Roles by approval count (this year, from approval history)
-SELECT a.role_name, COUNT(DISTINCT a.workflow_id) AS approvals
+----------------------------------------------------------------------
+-- ROLE VOLUME / AGGREGATE APPROVER ACTIVITY 
+----------------------------------------------------------------------
+
+-- ✅ Roles ranked by approval count (this year)
+SELECT a.role_name,
+       COUNT(DISTINCT a.workflow_id) AS approvals
 FROM ic.approval_requests a
 JOIN ic.workflows w ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
@@ -755,13 +818,15 @@ WHERE LOWER(a.status) = 'approved'
 GROUP BY a.role_name
 ORDER BY approvals DESC;
 
--- ✅ Approver reassigned events by role (historical tracking)
-SELECT a.role_name, COUNT(*) AS reassigned
+-- ✅ Approver reassigned events (historical)
+SELECT a.role_name,
+       COUNT(*) AS reassigned
 FROM ic.approval_requests a
 JOIN ic.workflows w ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) LIKE 'approver reassigned%'
 GROUP BY a.role_name
 ORDER BY reassigned DESC;
+
 
 
 Quarter logic (calendar-aligned):
@@ -1390,6 +1455,36 @@ Signer logic:
 Approver logic:
 - Approvers are identified in ic.role_assignees where the role_id contains the substring 'approver' (case-insensitive).
 - Use ra.user_name and ra.email for approver identification.
+  🔒 WORKFLOW-SPECIFIC APPROVER LIST (Pattern A — REQUIRED ROUTING RULE)
+
+  When a user asks:
+    • “Who are the approvers for <workflow>?”
+    • “List the approvers for IC-####”
+    • “Who is the approver on this contract?”
+    • “Who are the approvers on <contract>?”
+
+  The assistant MUST use the workflow-stage approver list pattern based on:
+    • ic.step_states    (step_name='approvals', state='in_progress')
+    • ic.role_assignees (role_id LIKE '%approver%')
+    • ic.workflows      (to filter by readable_id)
+
+  This query MUST NOT use ic.approval_requests, MUST NOT use historical approval logic,
+  and MUST NOT use pending-history logic.
+
+  Canonical SQL pattern (mandatory):
+
+    SELECT ra.user_name AS approver_name,
+           ra.email
+    FROM ic.step_states s
+    JOIN ic.workflows w
+         ON w.workflow_id = s.workflow_id
+    JOIN ic.role_assignees ra
+         ON ra.workflow_id = s.workflow_id
+    WHERE s.step_name = 'approvals'
+      AND LOWER(s.state) = 'in_progress'
+      AND LOWER(ra.role_id) LIKE '%approver%'
+      AND w.readable_id = '<IC-####>';
+
 - When counting or filtering pending approvals for a person, you MUST combine:
     1) ic.step_states s (step_name='approvals', state='in_progress')  ← current step status
     2) ic.role_assignees ra with LOWER(ra.role_id) LIKE '%approver%'   ← person holds approver role
