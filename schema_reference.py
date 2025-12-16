@@ -3,6 +3,29 @@ Database schema (schema = ic)
 SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
 
 - First, carefully interpret the user’s question in natural language.
+
+-- WORKFLOW IDENTIFICATION RULE (MANDATORY FOR ALL SQL RESULTS)
+
+For ANY SQL query where the assistant returns one or more workflows
+(e.g., “which workflow…”, “list workflows…”, “show the workflow…”, 
+“top workflows…”, “most comments…”, “most approvals…”, etc.):
+
+The assistant MUST always include BOTH of the following columns 
+in the SELECT list:
+
+    w.readable_id      AS workflow_id
+    w.title            AS title
+
+Rules:
+- This applies to ANY query returning rows—not just counts.
+- If the question returns a single workflow (top 1, LIMIT 1), 
+  the result must still include readable_id and title.
+- When using a CTE (wf), these fields MUST be selected inside 
+  the CTE and referenced as wf.readable_id and wf.title in the 
+  outer query.
+- This rule does NOT apply to pure count queries returning a 
+  single scalar (e.g., “how many workflows…”).
+
   • Identify what they are asking for: counts, lists, trends, or a specific contract.
   • Identify any dimensions: time window, department, contract type, vendor/counterparty, owner, signer, approver, import vs native.
   • Only then decide whether the answer should come from SQL (metadata/tables) or from text/embeddings.
@@ -97,6 +120,29 @@ SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
     unless they were selected in the CTE.
   - Never reference any column from wf that you did not explicitly SELECT in the CTE.
 
+  🔒 OUTER-QUERY ALIAS RULE (MUST NEVER BE VIOLATED)
+
+  After introducing a CTE aliased as wf, the assistant MUST NOT reference the
+  base-table alias w in the outer SELECT, WHERE, GROUP BY, or ORDER BY clauses.
+
+  In the outer query, ONLY use wf.<column> for fields selected inside the CTE.
+
+  Examples of forbidden patterns in the outer query:
+      w.record_type
+      w.title
+      w.status
+      w.attributes
+
+  Required replacements:
+      wf.record_type
+      wf.title
+      wf.status
+      wf.attributes
+
+  If the assistant needs a column in the outer query, it MUST be selected inside
+  the CTE first and referenced only as wf.<column>.
+
+
   🔒 CTE ALIAS REFERENCE RULE (HARD CONSTRAINT – NEVER VIOLATE THIS)
 
   Inside a CTE (`WITH wf AS (...)`), SQL SELECT aliases cannot be referenced in
@@ -149,17 +195,158 @@ SQL GENERATION GUARDRAILS (READ THIS BEFORE WRITING ANY QUERY)
       - year/quarter/month comparisons
       - spend/value summaries
 
+**ADDITIONAL REQUIRED RULE FOR CREATION QUESTIONS (MANDATORY)**
+
+For ANY question involving:
+  • “created”, “launched”, “started”
+  • “how many were created in <month/year>”
+  • “break down by month created”
+  • “created this year / month / quarter”
+  • most recently created workflows
+
+The assistant MUST always compute a unified creation timestamp:
+
+    CASE
+      WHEN w.attributes ? 'importId'
+        THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+      ELSE w.created_at
+    END AS created_ts
+
+Rules (MUST NOT be violated):
+
+1. created_ts MUST be included inside the CTE SELECT list.
+
+2. The assistant MUST NOT reference created_ts inside the CTE WHERE clause.
+   (Aliases are not visible inside the CTE WHERE; doing so causes SQL errors.)
+   Therefore the CTE WHERE may only use raw w.created_at or raw JSON fields.
+
+3. ALL filtering on creation timestamps MUST occur only in the OUTER QUERY:
+       WHERE created_ts >= <start>
+         AND created_ts <  <end>
+
+4. For imported workflows:
+   If smartImportProperty_predictionDate is missing, created_ts = NULL.
+   These rows MUST be excluded naturally using:
+       WHERE created_ts IS NOT NULL
+   in the outer query.
+
+5. All “break down by month/year of creation” queries MUST:
+   • use created_ts, never created_at alone
+   • select TO_CHAR(created_ts, 'YYYY-MM') or EXTRACT(MONTH FROM created_ts)
+   • group by the same expression
+   • include created_ts in the CTE SELECT
+
+6. NEVER fall back to last_updated_at, execution_date, agreementDate or expirationDate
+   for creation logic.
+
+EXAMPLE (canonical pattern):
+
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.readable_id,
+        w.title,
+        w.record_type,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN (w.attributes->'smartImportProperty_predictionDate'->>'value')::timestamptz
+          ELSE w.created_at
+        END AS created_ts
+      FROM ic.workflows w
+    )
+    SELECT
+      TO_CHAR(created_ts, 'YYYY-MM') AS month,
+      COUNT(*) AS contracts_created
+    FROM wf
+    WHERE created_ts IS NOT NULL
+      AND created_ts >= <start_of_year>
+      AND created_ts <  <start_of_next_year>
+    GROUP BY month
+    ORDER BY month;
+
+
+-- DURATION / AVERAGE TIME SAFETY RULE (MANDATORY)
+
+For ANY question involving:
+    • average time to complete
+    • average lifecycle duration
+    • days from creation to completion
+    • days from submission to execution
+    • time between created_at and completion
+    • longest / shortest time to complete
+    • any duration calculation of a workflow
+
+The assistant MUST:
+    • Use ONLY the canonical duration SQL pattern defined in the 
+      "Duration & Average Time Calculations" section.
+    • NEVER invent a new duration pattern.
+    • NEVER reference completion_ts inside the CTE WHERE clause.
+    • ALWAYS filter completion_ts only in the OUTER SELECT.
+    • ALWAYS compute completion_ts using:
+
+            CASE
+              WHEN w.attributes ? 'importId' THEN w.execution_date
+              ELSE COALESCE(w.execution_date, w.last_updated_at)
+            END AS completion_ts
+
+    • ALWAYS ensure both created_at and completion_ts are NOT NULL
+      in the OUTER QUERY, not inside the CTE.
+
+If the assistant places completion_ts inside the CTE WHERE clause,
+or attempts to filter it before the SELECT finishes, the SQL is invalid
+and MUST NOT be generated.
+
+
 - Time logic and contract type logic MUST follow the rules below.
   • For “completed/executed/finished” time windows, always use the unified completion_ts CASE pattern defined later.
   • For “recently created / launched / most recent” workflows, always use the unified created_ts CASE pattern defined later.
   • For contract types explicitly named by the user (NDA, MSA, SOW, etc.), ALWAYS use the ContractTypeMatch() rule defined below:
-        LOWER(w.record_type) = '<type>' OR LOWER(w.title) ILIKE '%<type>%'
+
+        ContractTypeMatch('<type>') means:
+
+            -- CASE 1: record_type explicitly matches the named contract type
+            LOWER(w.record_type) = '<type>'
+
+            -- CASE 2: record_type is NULL, so we fall back to title + filename pattern detection
+            OR (
+                w.record_type IS NULL
+                AND (
+                       -- NDA-like title patterns (standalone tokens, long-form names, etc.)
+                       LOWER(w.title) SIMILAR TO '%[^a-z0-9]<type>[^a-z0-9]%'     -- matches _nda_, -nda-, /nda/, etc.
+                    OR LOWER(w.title) LIKE '%mutual <type>%'
+                    OR LOWER(w.title) LIKE '%non-disclosure agreement%'
+                    OR LOWER(w.title) LIKE '%(<type>)%'
+                    OR LOWER(w.title) LIKE '%m<type>%'         -- e.g., MNDA
+                    OR LOWER(w.title) LIKE '%tripartite <type>%'
+                    OR LOWER(w.title) LIKE '%4-way <type>%'
+                    OR EXISTS (
+                          SELECT 1
+                          FROM ic.documents d
+                          WHERE d.workflow_id = w.workflow_id
+                            AND (
+                                   LOWER(d.filename) SIMILAR TO '%[^a-z0-9]<type>[^a-z0-9]%'
+                                OR LOWER(d.filename) LIKE '%mutual <type>%'
+                                OR LOWER(d.filename) LIKE '%non-disclosure agreement%'
+                                OR LOWER(d.filename) LIKE '%(<type>)%'
+                                OR LOWER(d.filename) LIKE '%m<type>%'
+                                OR LOWER(d.filename) LIKE '%tripartite <type>%'
+                                OR LOWER(d.filename) LIKE '%4-way <type>%'
+                            )
+                    )
+                )
+            )
+
     and never try to guess other patterns.
 
 - If the user’s question cannot be answered with a single clean query, prefer:
   • A small CTE + simple SELECT
   • Or multiple simple queries with clear, safe WHERE clauses
-  over one huge, complex, error-prone query.
+    over one huge, complex, error-prone query.
+
+
+
 
 -- Core workflow metadata (used by the GPT SQL path; do not invent columns)
 Table: workflows
@@ -410,23 +597,78 @@ and "list them" for all native + imported workflows.
   ✅ Use record_type for “How many NDAs/MSAs/SOWs?”
   ❌ Do not use document_type for contract type classification.
 
-  -- Contract type detection (NDA / MSA / SOW / etc.) for recency or listing questions
+-- Contract type detection (NDA / MSA / SOW / etc.) for recency or listing questions
   Some workflows (especially imported ones) do NOT populate record_type even when the
   contract is clearly an NDA, MSA, SOW, etc. In those cases, the title reliably includes
-  the contract type keyword.
+  the contract type keyword. However, some workflows contain contract-type indicators
+  only inside uploaded document filenames (e.g., filenames containing “NDA”, “MSA”, “SOW”).
 
   Therefore, for ANY question where the user explicitly names a contract type
   (“recent NDA”, “latest NDA”, “most recent SOW”, “recent MSA”), ALWAYS use this
   combined detection rule:
 
        ContractTypeMatch('<type>'):
+            -- CASE 1: Explicit record_type match (authoritative)
             LOWER(w.record_type) = '<type>'
-            OR LOWER(w.title) ILIKE '%<type>%'
+
+            -- CASE 2: record_type is NULL → fall back to title + filename detection
+            OR (
+                w.record_type IS NULL
+                AND (
+                       -- Title patterns indicating NDA/MSA/SOW etc.
+                       LOWER(w.title) SIMILAR TO '%[^a-z0-9]<type>[^a-z0-9]%'   -- matches _nda_, -nda-, /nda/, etc.
+                    OR LOWER(w.title) LIKE '%mutual <type>%'
+                    OR LOWER(w.title) LIKE '%non-disclosure agreement%'
+                    OR LOWER(w.title) LIKE '%(<type>)%'
+                    OR LOWER(w.title) LIKE '%m<type>%'         -- e.g., MNDA
+                    OR LOWER(w.title) LIKE '%tripartite <type>%'
+                    OR LOWER(w.title) LIKE '%4-way <type>%'
+                    OR EXISTS (
+                          SELECT 1
+                          FROM ic.documents d
+                          WHERE d.workflow_id = w.workflow_id
+                            AND (
+                                   LOWER(d.filename) SIMILAR TO '%[^a-z0-9]<type>[^a-z0-9]%'
+                                OR LOWER(d.filename) LIKE '%mutual <type>%'
+                                OR LOWER(d.filename) LIKE '%non-disclosure agreement%'
+                                OR LOWER(d.filename) LIKE '%(<type>)%'
+                                OR LOWER(d.filename) LIKE '%m<type>%'
+                                OR LOWER(d.filename) LIKE '%tripartite <type>%'
+                                OR LOWER(d.filename) LIKE '%4-way <type>%'
+                            )
+                    )
+                )
+            )
 
   Examples:
       ContractTypeMatch('nda') means:
           LOWER(w.record_type) = 'nda'
-          OR LOWER(w.title) ILIKE '%nda%'
+          OR (
+               w.record_type IS NULL
+               AND (
+                      LOWER(w.title) SIMILAR TO '%[^a-z0-9]nda[^a-z0-9]%'
+                   OR LOWER(w.title) LIKE '%mutual nda%'
+                   OR LOWER(w.title) LIKE '%non-disclosure agreement%'
+                   OR LOWER(w.title) LIKE '%(nda)%'
+                   OR LOWER(w.title) LIKE '%mnda%'
+                   OR LOWER(w.title) LIKE '%tripartite nda%'
+                   OR LOWER(w.title) LIKE '%4-way nda%'
+                   OR EXISTS (
+                         SELECT 1
+                         FROM ic.documents d
+                         WHERE d.workflow_id = w.workflow_id
+                           AND (
+                                  LOWER(d.filename) SIMILAR TO '%[^a-z0-9]nda[^a-z0-9]%'
+                               OR LOWER(d.filename) LIKE '%mutual nda%'
+                               OR LOWER(d.filename) LIKE '%non-disclosure agreement%'
+                               OR LOWER(d.filename) LIKE '%(nda)%'
+                               OR LOWER(d.filename) LIKE '%mnda%'
+                               OR LOWER(d.filename) LIKE '%tripartite nda%'
+                               OR LOWER(d.filename) LIKE '%4-way nda%'
+                           )
+                   )
+               )
+          )
 
   This combined rule MUST NOT be used unless the contract type is explicitly mentioned
   in the user’s question.
@@ -454,7 +696,32 @@ and "list them" for all native + imported workflows.
           FROM ic.workflows w
           WHERE (
              LOWER(w.record_type) = 'nda'
-             OR LOWER(w.title) ILIKE '%nda%'
+             OR (
+                   w.record_type IS NULL
+                   AND (
+                          LOWER(w.title) SIMILAR TO '%[^a-z0-9]nda[^a-z0-9]%'
+                       OR LOWER(w.title) LIKE '%mutual nda%'
+                       OR LOWER(w.title) LIKE '%non-disclosure agreement%'
+                       OR LOWER(w.title) LIKE '%(nda)%'
+                       OR LOWER(w.title) LIKE '%mnda%'
+                       OR LOWER(w.title) LIKE '%tripartite nda%'
+                       OR LOWER(w.title) LIKE '%4-way nda%'
+                       OR EXISTS (
+                             SELECT 1
+                             FROM ic.documents d
+                             WHERE d.workflow_id = w.workflow_id
+                               AND (
+                                      LOWER(d.filename) SIMILAR TO '%[^a-z0-9]nda[^a-z0-9]%'
+                                   OR LOWER(d.filename) LIKE '%mutual nda%'
+                                   OR LOWER(d.filename) LIKE '%non-disclosure agreement%'
+                                   OR LOWER(d.filename) LIKE '%(nda)%'
+                                   OR LOWER(d.filename) LIKE '%mnda%'
+                                   OR LOWER(d.filename) LIKE '%tripartite nda%'
+                                   OR LOWER(d.filename) LIKE '%4-way nda%'
+                               )
+                       )
+                   )
+               )
           )
         )
         SELECT readable_id, title, created_ts
@@ -589,6 +856,18 @@ DEPARTMENT LOGIC:
 
 - po_number (TEXT)
 - requisition_number (TEXT)
+-- Requisition vs Purchase Order (REQ / PO)
+-- The REQ / PO classification for a workflow is stored in:
+--     w.attributes->>'rEQOrPo'
+-- and contains values such as 'REQ' or 'PO'.
+
+-- Canonical SQL pattern (mandatory):
+SELECT
+    w.readable_id,
+    w.attributes->>'rEQOrPo' AS req_or_po
+FROM ic.workflows w
+WHERE w.readable_id = '<IC-####>';
+
 
 - contract_value_amount (NUMERIC)
 - contract_value_currency (TEXT)
@@ -672,6 +951,25 @@ Routing rule:
     • who has approved
     • who is still pending
 
+🔒 WORKFLOW-SPECIFIC REQ / PO DETECTION (REQUIRED ROUTING RULE)
+
+When the user asks:
+  • “REQ or PO?”
+  • “Is this a REQ or a PO?”
+  • “Is IC-#### a requisition or a purchase order?”
+  • “What type of request is IC-####?”
+  • “Is this workflow a PO?” or “Is this workflow a REQ?”
+
+The assistant MUST:
+  • Query the field: w.attributes->>'rEQOrPo'
+  • Return the exact value ('REQ' or 'PO').
+
+The assistant MUST NOT:
+  • Use contract text, embeddings, or chunk search.
+  • Attempt to infer REQ/PO from SOW/MSA/NDA or other document types.
+  • Use document_type, requestType, or any unrelated fields.
+
+
 
 Time windows (always anchor to CURRENT_DATE):
 - Month:
@@ -702,6 +1000,66 @@ Time windows (always anchor to CURRENT_DATE):
     • Use "last 7 days" logic only if the user says: “past 7 days”, “last 7 days”, “in the last week”.
   - If the user does NOT specify a timeframe, do not apply a date filter.
 
+-- YEAR-OVER-YEAR COMPARISON RULES (REQUIRED FOR “THIS YEAR VS LAST YEAR” QUESTIONS)
+
+For ANY question comparing activity between *this year* and *last year* —
+including counts, executions, completions, spend totals, contract value,
+approvals, or signer activity — the assistant MUST use calendar-aligned
+year boundaries based on CURRENT_DATE.
+
+Canonical definitions:
+    this_year_start = date_trunc('year', CURRENT_DATE)
+    next_year_start = this_year_start + INTERVAL '1 year'
+    last_year_start = this_year_start - INTERVAL '1 year'
+
+Time windows:
+    “this year” → completion_ts >= this_year_start
+                  AND completion_ts < next_year_start
+
+    “last year” → completion_ts >= last_year_start
+                  AND completion_ts < this_year_start
+
+Rules:
+- NEVER hardcode years unless the user explicitly provides the year.
+- ALWAYS compute year windows from CURRENT_DATE.
+- ALWAYS use completion_ts for executed/completed workflow comparisons.
+- NEVER filter completion_ts inside the CTE — only in the outer WHERE.
+- When grouping by year, always compute:
+      EXTRACT(YEAR FROM completion_ts)::INT AS year
+
+Canonical SQL pattern for “this year vs last year”:
+
+    WITH wf AS (
+      SELECT
+        w.workflow_id,
+        w.title,
+        w.record_type,
+        w.status,
+        w.attributes,
+        CASE
+          WHEN w.attributes ? 'importId'
+            THEN w.execution_date
+          ELSE COALESCE(w.execution_date, w.last_updated_at)
+        END AS completion_ts
+      FROM ic.workflows w
+      WHERE (w.status='completed' OR w.attributes ? 'importId')
+    )
+    SELECT
+       EXTRACT(YEAR FROM completion_ts)::INT AS year,
+       COUNT(*) AS contracts_executed
+    FROM wf
+    WHERE completion_ts IS NOT NULL
+      AND completion_ts >= (date_trunc('year', CURRENT_DATE) - INTERVAL '1 year')
+      AND completion_ts <  (date_trunc('year', CURRENT_DATE) + INTERVAL '1 year')
+    GROUP BY year
+    ORDER BY year;
+
+Notes:
+- This block governs ALL questions using phrases like:
+      “this year”, “last year”, “year over year”, “vs last year”,
+      “compared to last year”, “YOY”, “this year so far”
+- Applies equally to executions, completions, approvals, signings,
+  contract counts, contract value, and department metrics.
 
 Workflow scope:
 - If user says “in progress” → add w.status='active'.
@@ -730,6 +1088,7 @@ JOIN ic.role_assignees ra
 JOIN ic.workflows w
   ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
+  AND LOWER(ra.role_id) LIKE '%approver%'
   AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%');
 
 -- ✅ Approvals by <person> (this month)
@@ -740,6 +1099,7 @@ JOIN ic.role_assignees ra
 JOIN ic.workflows w
   ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
+  AND LOWER(ra.role_id) LIKE '%approver%'
   AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%')
   AND a.end_time >= date_trunc('month', CURRENT_DATE)
   AND a.end_time <  date_trunc('month', CURRENT_DATE) + INTERVAL '1 month';
@@ -752,6 +1112,7 @@ JOIN ic.role_assignees ra
 JOIN ic.workflows w
   ON w.workflow_id = a.workflow_id
 WHERE LOWER(a.status) = 'approved'
+  AND LOWER(ra.role_id) LIKE '%approver%'
   AND (LOWER(ra.user_name) ILIKE '%jane doe%' OR LOWER(ra.email) ILIKE '%jane doe%')
   AND a.end_time >= CURRENT_DATE - INTERVAL '3 months'
   AND a.end_time < CURRENT_DATE;
@@ -1114,13 +1475,13 @@ always compute the difference between creation and completion using the unified 
 
 ✅ Calculation rules:
 - Always include workflows where (status = 'completed' OR attributes ? 'importId').
-- Exclude rows where either created_at or completion_ts is NULL.
+- Do NOT filter completion_ts inside the CTE. Only compute it there.
+- Exclude rows where created_at or completion_ts is NULL in the OUTER QUERY.
 - Use EXTRACT(EPOCH FROM (...)) / 86400 to compute duration in days, rounded to 2 decimals.
 - When grouping by department, normalize department names via ic.department_map and ic.department_canonical.
-- Exclude departments with NULL or invalid average values when ranking.
+- Exclude departments with NULL or invalid averages when ranking.
 - When grouping by department (or joining to department tables), the CTE must SELECT w.department and w.owner_name.
-- Always use COALESCE(w.execution_date, w.last_updated_at) consistently in both SELECT and WHERE clauses.
-
+- Always compute completion_ts using the unified CASE expression consistently.
 
 -- ✅ Example (average number of days to complete per department)
 WITH wf AS (
@@ -1139,16 +1500,14 @@ WITH wf AS (
     END AS completion_ts
   FROM ic.workflows w
   WHERE (w.status = 'completed' OR w.attributes ? 'importId')
-    AND (
-      CASE
-        WHEN w.attributes ? 'importId' THEN w.execution_date
-        ELSE COALESCE(w.execution_date, w.last_updated_at)
-      END
-    ) IS NOT NULL
 )
 SELECT
-  COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified') AS department_clean,
-  ROUND(AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric, 2) AS average_days_to_complete
+  COALESCE(dm.canonical_value, c1.canonical_value, c2.canonical_value, 'Department not specified')
+      AS department_clean,
+  ROUND(
+    AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric,
+    2
+  ) AS average_days_to_complete
 FROM wf
 LEFT JOIN ic.department_map dm
   ON UPPER(TRIM(wf.department)) = UPPER(dm.raw_value)
@@ -1159,7 +1518,10 @@ LEFT JOIN ic.department_canonical c2
 WHERE wf.created_at IS NOT NULL
   AND wf.completion_ts IS NOT NULL
 GROUP BY department_clean
-HAVING ROUND(AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric, 2) IS NOT NULL
+HAVING ROUND(
+          AVG(EXTRACT(EPOCH FROM (wf.completion_ts - wf.created_at)) / 86400)::numeric,
+          2
+        ) IS NOT NULL
 ORDER BY average_days_to_complete DESC
 LIMIT 5;
 
@@ -1169,7 +1531,7 @@ LIMIT 5;
 - Excludes incomplete or null data.
 - Normalizes department names for clean grouping.
 - Returns departments ranked by average completion time in days.
-- AND now aligns fully with the CTE SAFETY RULE so GPT never chooses a broken pattern.
+- AND fully obeys the CTE Safety Rule (no WHERE conditions on aliases inside CTE).
 
 -- Alternate representation (interval format)
 -- Note: This example intentionally omits w.department / w.owner_name.
@@ -1189,23 +1551,14 @@ WITH wf AS (
     END AS completion_ts
   FROM ic.workflows w
   WHERE (w.status = 'completed' OR w.attributes ? 'importId')
-    AND (
-      CASE
-        WHEN w.attributes ? 'importId' THEN w.execution_date
-        ELSE COALESCE(w.execution_date, w.last_updated_at)
-      END
-    ) IS NOT NULL
 )
-SELECT
-  justify_interval(AVG(wf.completion_ts - wf.created_at)) AS average_duration
+SELECT justify_interval(
+         AVG(wf.completion_ts - wf.created_at)
+       ) AS average_duration
 FROM wf
 WHERE wf.created_at IS NOT NULL
   AND wf.completion_ts IS NOT NULL;
 
-
-✅ Why:
-- Provides interval-based output (e.g., “42 days 12:00:00”).
-- Useful when users request formatted time durations instead of numeric days.
 
 
 Guidance:
