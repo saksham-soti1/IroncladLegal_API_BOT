@@ -908,11 +908,19 @@ Status values (history records):
     • LOWER(a.status) LIKE 'approver reassigned%'.
 
 Routing rule:
-- All “pending approval/signature” counts (generic or person-specific) → ic.step_states (authoritative current state).
-- For person-specific pending, ALSO require role matches in ic.role_assignees:
-    • approvals → LOWER(ra.role_id) LIKE '%approver%'
-    • signatures → LOWER(ra.role_id) LIKE '%signer%'
-- Use ic.approval_requests only for history/decisions (approved dates, reassigned), not for current pending counts.
+- All “pending approval” counts and lists (generic or person-specific) → ic.approval_requests a
+    JOIN ic.role_assignees ra ON (ra.workflow_id = a.workflow_id AND ra.role_id = a.role_id)
+    JOIN ic.workflows w ON w.workflow_id = a.workflow_id
+    with:
+        LOWER(a.status) = 'pending'
+        AND LOWER(w.status) = 'active'
+        AND LOWER(ra.role_id) LIKE '%approver%'.
+- All “pending signature” counts (generic or person-specific) → ic.step_states
+    with s.step_name='signatures', LOWER(s.state)='in_progress', and w.status='active'
+    plus role_assignees when a specific signer is named.
+- ic.approval_requests is the authoritative source for individual approver status
+    (pending vs approved) and must be used for any “pending <person>’s approval” questions.
+
 
   🔒 WORKFLOW-SPECIFIC APPROVAL STATUS (Pattern B — REQUIRED ROUTING RULE)
 
@@ -1064,8 +1072,9 @@ Notes:
 Workflow scope:
 - If user says “in progress” → add w.status='active'.
 - If user says “completed” → add w.status='completed'.
-- “Pending approval” → ic.step_states (step_name='approvals', state='in_progress') + w.status='active'.
-    • If a person/role is named → ALSO require ic.role_assignees with LOWER(role_id) LIKE '%approver%'.
+- “Pending approval” → ic.approval_requests (status='pending') + w.status='active'
+    • Always join ic.role_assignees ON workflow_id + role_id and require LOWER(ra.role_id) LIKE '%approver%'.
+    • For person-specific questions, also filter by name/email on ra.user_name / ra.email.
 - “Pending signature” → ic.step_states (step_name='signatures', state='in_progress') + w.status='active'.
     • If a person/role is named → ALSO require ic.role_assignees with LOWER(role_id) LIKE '%signer%'.
 - If no state specified → include all.
@@ -1121,13 +1130,18 @@ WHERE LOWER(a.status) = 'approved'
 -- GENERIC PENDING COUNTS (Pattern: step_states – NOT approval history)
 ----------------------------------------------------------------------
 
--- ✅ Generic pending approvals (current step state, not history)
-SELECT COUNT(*) AS pending_approvals
-FROM ic.step_states s
-JOIN ic.workflows w ON w.workflow_id = s.workflow_id
-WHERE s.step_name = 'approvals'
-  AND LOWER(s.state) = 'in_progress'
-  AND LOWER(w.status) = 'active';
+-- ✅ Generic pending approvals (person- and role-aware, uses approval history)
+SELECT COUNT(DISTINCT a.workflow_id) AS pending_approvals
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id
+ AND ra.role_id      = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id   = a.workflow_id
+WHERE LOWER(a.status) = 'pending'
+  AND LOWER(w.status) = 'active'
+  AND LOWER(ra.role_id) LIKE '%approver%';
+
 
 -- ✅ Generic pending signatures (current step state, not history)
 SELECT COUNT(*) AS pending_signatures
@@ -1143,15 +1157,43 @@ WHERE s.step_name = 'signatures'
 ----------------------------------------------------------------------
 
 -- ✅ Person-specific pending approvals, use name that they passed in. If only first name is provided, only first name. If both are provided, use both.
-SELECT COUNT(*) AS pending_for_person
-FROM ic.step_states s
-JOIN ic.workflows w       ON w.workflow_id = s.workflow_id
-JOIN ic.role_assignees ra ON ra.workflow_id = s.workflow_id
-WHERE s.step_name = 'approvals'
-  AND LOWER(s.state) = 'in_progress'
+SELECT COUNT(DISTINCT a.workflow_id) AS pending_for_person
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id
+ AND ra.role_id      = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id   = a.workflow_id
+WHERE LOWER(a.status) = 'pending'
   AND LOWER(w.status) = 'active'
   AND LOWER(ra.role_id) LIKE '%approver%'
-  AND (LOWER(ra.user_name) ILIKE '%stephanie haycox%' OR LOWER(ra.email) ILIKE '%stephanie haycox%');
+  AND (
+        LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+     OR LOWER(ra.email)    ILIKE '%stephanie haycox%'
+  );
+
+-- ✅ List workflows pending a specific person's approval
+SELECT DISTINCT
+    w.readable_id,
+    w.title,
+    ra.user_name AS approver_name,
+    ra.email     AS approver_email,
+    LOWER(a.status) AS approval_status
+FROM ic.approval_requests a
+JOIN ic.role_assignees ra
+  ON ra.workflow_id = a.workflow_id
+ AND ra.role_id      = a.role_id
+JOIN ic.workflows w
+  ON w.workflow_id   = a.workflow_id
+WHERE LOWER(a.status) = 'pending'
+  AND LOWER(w.status) = 'active'
+  AND LOWER(ra.role_id) LIKE '%approver%'
+  AND (
+        LOWER(ra.user_name) ILIKE '%stephanie haycox%'
+     OR LOWER(ra.email)    ILIKE '%stephanie haycox%'
+  )
+ORDER BY w.readable_id;
+
 
 -- ✅ Person-specific pending signatures
 SELECT COUNT(*) AS pending_signatures_for_person
@@ -1890,10 +1932,20 @@ Step-state logic:
     • w.step='archive' → Archive stage (ic.step_states is not consulted)
 
 - Interpretation rules:
-    • “Pending approval” → s.step_name='approvals' AND LOWER(state)='in_progress'
-    • “Pending signature” or “awaiting signature” → s.step_name='signatures' AND LOWER(state)='in_progress'
-    • “Fully signed” or “completed signatures” → s.step_name='signatures' AND LOWER(state)='completed'
-    • “Create” / “Archive” stages → always use w.step from ic.workflows when it is non-null.
+    • For step/stage detection only (NOT for counts/lists), treat “pending approval” as:
+         s.step_name='approvals' AND LOWER(state)='in_progress'.
+      (Do NOT use this pattern for pending-approval questions that ask “how many”
+       or “list”—those MUST use approval_requests with status='pending'.)
+
+    • “Pending signature” or “awaiting signature”
+         → s.step_name='signatures' AND LOWER(state)='in_progress'
+
+    • “Fully signed” or “completed signatures”
+         → s.step_name='signatures' AND LOWER(state)='completed'
+
+    • “Create” / “Archive” stages
+         → always use w.step from ic.workflows when it is non-null.
+
 
 - Always use LOWER(state) when filtering.
 
@@ -2004,7 +2056,9 @@ ORDER BY current_step;
 
 
 - When users ask about pending approvals or signatures, always query ic.step_states instead of ic.approval_requests.
-- For Create/Archive, use ic.workflows.step directly.
+- For Create/Archive, use ic.workflows.step directly.- When users ask about pending approvals, always query ic.approval_requests (status = 'pending')
+  joined with ic.role_assignees and ic.workflows as described above.
+  For pending signatures, continue to use ic.step_states (step_name='signatures', state='in_progress').
 - When listing or grouping by step, combine both sources as shown above.
 - For additional filters (e.g., department, record_type, vendor), join ic.workflows as needed.
 
