@@ -80,7 +80,7 @@ HARD RULES (controller-level):
 - SELECT-only. Never emit CREATE/INSERT/UPDATE/DELETE/DROP/ALTER/TRUNCATE/GRANT/REVOKE/MERGE/VACUUM/COPY/SET/SHOW.
 - The terms "contract(s)", "agreement(s)", and "workflow(s)" all refer to records in ic.workflows.
 - For counts like "how many contracts/agreements/workflows", count rows from ic.workflows.
-- For listing, return workflow-level fields (w.readable_id, w.title, etc.) and LIMIT 100 unless user asks otherwise.
+- For listing, return workflow-level fields (w.readable_id, w.title, etc.) and LIMIT 200 unless user asks otherwise.
 - Do not invent column names. Use only columns that exist in the live schema below.
 
 OUTPUT SHAPE:
@@ -214,7 +214,7 @@ def build_general_summarizer_prompt() -> str:
         "- If 'text_singleton_value' exists and is not null, use that value as the authoritative SQL answer.\n"
         "  Write a concise 1–2 sentence interpretation of that value that answers the resolved_question.\n"
         "- Format money with $ and commas.\n"
-        "- If zero rows, say 'No matching results were found, meaning no data was found for the given filters.'\n"
+        "- Only say 'No matching results were found' when the SQL 'rows' array is truly empty (length = 0). If rows contain any data, NEVER say this.\n"
         "- Keep to 1–2 sentences; no SQL, no tables.\n"
     )
 
@@ -717,7 +717,9 @@ def classify_intent(q: str) -> Dict[str, Any]:
         {"role": "user", "content": q},
     ]
 
-    resp = client.chat.completions.create(model="gpt-4o-mini", temperature=0, messages=msgs)
+    resp = client.chat.completions.create(model="gpt-4o-mini",
+                                          temperature=0,
+                                          messages=msgs)
     content = resp.choices[0].message.content or "{}"
     print("DEBUG RAW INTENT LLM OUTPUT:", content)
 
@@ -731,19 +733,23 @@ def classify_intent(q: str) -> Dict[str, Any]:
     js.setdefault("terms", [])
     js.setdefault("logic", {"operator": "AND", "exclude": []})
     js.setdefault("near", {"enabled": False, "window": 120})
-    js.setdefault("readable_ids", [])
 
-    # LLM sometimes outputs [None] or [null] or non-list → clean it
-    if js.get("readable_ids"):
-        cleaned = [rid for rid in js["readable_ids"] if isinstance(rid, str) and rid.strip()]
-        js["readable_ids"] = cleaned
+    # ======================================================
+    # 🔥 READABLE IDS — HARD NORMALIZATION (THE REAL FIX)
+    # ======================================================
+    rids = js.get("readable_ids")
+    if not isinstance(rids, list):
+        rids = []
+    # Remove non-string values
+    rids = [rid for rid in rids if isinstance(rid, str)]
+    js["readable_ids"] = rids
+    # ======================================================
 
-    # ---- 🔥 HARD NORMALIZATION FIX (prevents NoneType iteration crashes) ----
     # Terms must always be a list
     if js.get("terms") is None:
         js["terms"] = []
 
-    # Logic must always be a properly shaped dict
+    # Logic must always be a dict
     if js.get("logic") is None or not isinstance(js["logic"], dict):
         js["logic"] = {"operator": "AND", "exclude": []}
     else:
@@ -751,9 +757,8 @@ def classify_intent(q: str) -> Dict[str, Any]:
         js["logic"].setdefault("exclude", [])
         if js["logic"]["exclude"] is None:
             js["logic"]["exclude"] = []
-    # ---- end fix ----
 
-    # Normalize readable IDs → only valid IC-#### allowed
+    # Normalize readable IDs → IC-#### only
     valid_ids = []
     for rid in js["readable_ids"]:
         if isinstance(rid, str) and re.fullmatch(r"IC-\d+", rid.strip(), re.IGNORECASE):
@@ -764,13 +769,13 @@ def classify_intent(q: str) -> Dict[str, Any]:
     js.setdefault("vendor_term", None)
     js.setdefault("notes", None)
 
-    # Special rule for "clause"
+    # Clause rule
     if "clause" in q.lower():
         js["intent"] = "sql_generic"
 
     print("DEBUG FINAL INTENT JSON:", js)
 
-    # Final sanitize of readable_ids
+    # Final sanitize (guaranteed list — safe to iterate)
     ids = js.get("readable_ids", [])
     if not isinstance(ids, list):
         ids = []
@@ -781,6 +786,7 @@ def classify_intent(q: str) -> Dict[str, Any]:
     js["readable_ids"] = cleaned
 
     return js
+
 
 
 
@@ -1215,15 +1221,29 @@ def answer_question(
         # --- Prepare prompt dynamically ---
         if is_single_contract:
             system_prompt = (
-                f"You are a legal contracts analyst. Answer only from the provided text chunks of contract {rid}. "
-                "Cite exact phrases using (IC-#### #chunk_id). If the answer is unclear or not found, say so."
+                f"You are a legal contracts analyst. Your primary source is the provided text "
+                f"chunks of contract {rid}. Cite exact phrases using (IC-#### #chunk_id) whenever possible.\n\n"
+
+                "RULES:\n"
+                "1. Always ground factual details (definitions, obligations, clauses) ONLY in the provided text.\n"
+                "2. If the user's question asks for evaluation, comparison, risk assessment, typicality, "
+                "industry standards, or interpretation that is NOT explicitly stated in the text:\n"
+                "      • You MAY use your general legal and commercial knowledge.\n"
+                "      • Make it clear when the text does NOT state something directly.\n"
+                "      • Provide a reasoned, professional opinion based on common contract practices.\n"
+                "3. Never fabricate contract-specific facts that are not in the text.\n"
             )
         else:
             system_prompt = (
-                "You are a legal contracts analyst. Synthesize insights from multiple contracts. "
-                "Use only the retrieved text chunks. Group related findings and cite each with (IC-#### #chunk_id). "
-                "Never speculate beyond the text."
+                "You are a legal contracts analyst. Synthesize insights from multiple retrieved contracts.\n"
+                "Use the text as primary evidence but you MAY use general legal knowledge when the user asks for:\n"
+                "   • comparisons\n"
+                "   • risk assessments\n"
+                "   • industry-standard evaluations\n"
+                "   • typicality/market-norm commentary\n"
+                "Cite text when relevant. Do NOT fabricate contract-specific facts.\n"
             )
+
 
         payload = {
             "question": resolved_q,
@@ -1497,6 +1517,7 @@ FROM ic.contract_chunks WHERE chunk_text ILIKE '%'||%s||'%' ORDER BY readable_id
             "columns": cols,
             "rows_preview": safe_json(rows[:50]),
             "row_count_returned": len(rows),
+            "has_rows": len(rows) > 0,
             "true_numeric_result": numeric_value,
             "text_singleton_value": text_singleton_value,
             "intent": intent,
